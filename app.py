@@ -237,6 +237,50 @@ def is_relevant(title, snippet=""):
 
 
 # ============================================================================
+# Geographic filter: accept only US listings, excluding Hawaii and Alaska
+# ============================================================================
+
+NON_US_COUNTRY_RX = re.compile(
+    r"\b(canada|canadian|united\s*kingdom|\bu\.?k\.?\b|england|scotland|wales|ireland|"
+    r"australia|new\s*zealand|germany|france|italy|spain|netherlands|belgium|"
+    r"japan|china|mexico|brazil|philippines|south\s*africa|"
+    r"ontario|quebec|alberta|manitoba|british\s*columbia|nova\s*scotia|saskatchewan)\b",
+    re.I,
+)
+
+HI_AK_NAME_RX = re.compile(
+    r"\bhawaii\b|\balaska\b|"
+    r"honolulu|anchorage|fairbanks|juneau|\bhilo\b|"
+    r"\bmaui\b|\bkauai\b|\boahu\b|kodiak",
+    re.I,
+)
+
+# State code "HI" or "AK" in a location-like context: ", HI" / "- AK" / "(HI)" etc.
+HI_AK_CODE_RX = re.compile(
+    r"(?:^|[,\-\(\s])(?:HI|AK)(?:\s|,|\)|\.|$|\d)"
+)
+
+
+def location_acceptable(title, location):
+    """
+    Return False if the listing is clearly from outside the continental US
+    (non-US countries, Hawaii, or Alaska). Return True if it looks US mainland
+    or the location is unknown.
+    """
+    for field in [location, title]:
+        if not field:
+            continue
+        s = str(field)
+        if NON_US_COUNTRY_RX.search(s):
+            return False
+        if HI_AK_NAME_RX.search(s):
+            return False
+        if HI_AK_CODE_RX.search(s):
+            return False
+    return True
+
+
+# ============================================================================
 # Source adapters
 # ============================================================================
 
@@ -256,7 +300,8 @@ def search_serpapi(queries, api_key, results_per_query=20, progress_cb=None):
             r = requests.get(
                 "https://serpapi.com/search",
                 params={"q": q, "api_key": api_key, "num": results_per_query,
-                        "engine": "google", "hl": "en"},
+                        "engine": "google", "hl": "en", "gl": "us",
+                        "location": "United States"},
                 timeout=30,
             )
             data = r.json()
@@ -278,7 +323,7 @@ def search_ebay(queries, max_pages=2, progress_cb=None):
         if progress_cb: progress_cb(i, len(queries), f"eBay: {q}")
         for page in range(1, max_pages + 1):
             try:
-                url = f"https://www.ebay.com/sch/i.html?_nkw={quote_plus(q)}&_pgn={page}&LH_Sold=0"
+                url = f"https://www.ebay.com/sch/i.html?_nkw={quote_plus(q)}&_pgn={page}&LH_Sold=0&LH_PrefLoc=1"
                 r = requests.get(url, headers=HEADERS, timeout=20)
                 soup = BeautifulSoup(r.text, "html.parser")
                 for item in soup.select("li.s-item"):
@@ -371,6 +416,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
     for r in raw_results:
         texts = [r.get("title", ""), r.get("snippet", "")]
         if not is_relevant(*texts): continue
+        if not location_acceptable(r.get("title", ""), r.get("location", "")):
+            continue
         r["brand"] = detect_brand(*texts)
         if r["brand"] == "unknown": continue
         r["quantity"] = extract_quantity(*texts)
