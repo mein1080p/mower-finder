@@ -172,6 +172,23 @@ DEFAULT_BASE_QUERIES = [
     "golf course equipment auction walking greens",
     "used greens mower fleet liquidation",
 ]
+
+# Queries specifically designed to find pages on individual golf course websites
+# that list used equipment for sale. Use Google dorks like "site:" and intitle:"
+# to force Google to look for the pattern we want.
+DEFAULT_GOLF_COURSE_QUERIES = [
+    '"used equipment" "for sale" golf course "greensmaster" OR "e-cut"',
+    '"pro shop" OR "superintendent" "for sale" greensmaster walking',
+    '"golf club" OR "country club" classifieds "greens mower"',
+    'intitle:"equipment for sale" golf course greensmaster',
+    'intitle:"used equipment" golf "walking greens"',
+    '"golf course" "for sale" "John Deere 220" OR "John Deere 180SL"',
+    '"golf course" "fleet" "Toro Greensmaster" selling',
+    'golf course "equipment sales" greensmaster walk behind',
+    '"superintendent" selling "walking greens mower" -reddit',
+    '"country club" "surplus equipment" greens mower',
+]
+
 DEFAULT_SUBREDDITS = ["golfcourse", "turfgrass", "Golf", "turfequipment"]
 
 
@@ -240,9 +257,25 @@ def is_relevant(title, snippet=""):
         r"\bgreens?\b|\bwalk[-\s]*behind\b|\bwalking[-\s]*greens?\b|greensmaster|"
         r"precisioncut|e[-\s]?cut|\d{3}\s*sl\b", text))
     excluded = bool(re.search(
+        # Toys / models / RC
         r"\btoy\b|\bmodel\s*car\b|\b(?:rc|radio\s*control)\b|\bminiature\b|"
+        # Zero-turn / riding consumer mowers
         r"z[-\s]?trak|\bzero[-\s]*turn\b|\briding\s*mower\b|\bpush\s*mower\b|"
-        r"\brotary\s*mower\b|\blawn\s*tractor\b", text))
+        r"\brotary\s*mower\b|\blawn\s*tractor\b|"
+        # Toro riding triplex / triflex greens mowers (NOT walking)
+        r"\btriplex\b|\btriflex\b|\btri[-\s]?plex\b|\btri[-\s]?flex\b|"
+        # Specific Toro riding Greensmaster models (3100, 3150, 3200, 3250, 3300, 3320, 3400, 3420, 3500)
+        r"\bgreensmaster\s*3\d{3}\b|\b3[0-5]\d{2}\s*(?:greensmaster|reel|triplex|triflex|riding)\b|"
+        # Standalone 3300 / 3320 / 3400 etc. when preceded by Toro/greensmaster nearby
+        r"\btoro\s*3[0-5]\d{2}\b|"
+        # John Deere riding triplex models (2500, 2550, 2653, 2700, 2750, 7200, 7500, 8500, 8700, 8800, 8900)
+        r"\b(?:2500|2550|2653|2700|2750|7200|7500|8500|8700|8800|8900)[a-z]?\s*(?:greens|john|jd|deere|triplex|riding|precisioncut)\b|"
+        r"\b(?:john\s*deere|jd|deere)\s*(?:2500|2550|2653|2700|2750|7200|7500|8500|8700|8800|8900)\b|"
+        # Fairway mowers (different beast entirely)
+        r"\bfairway\s*mower\b|\bfairway\s*reel\b|"
+        # Rough mowers
+        r"\brough\s*mower\b"
+        , text))
     return has_greens and not excluded
 
 
@@ -287,6 +320,95 @@ def location_acceptable(title, location):
             return False
         if HI_AK_CODE_RX.search(s):
             return False
+    return True
+
+
+# ============================================================================
+# URL quality filter: reject generic search pages, category pages, etc. that
+# would just take the user to a list of results instead of a specific listing
+# ============================================================================
+
+def url_is_specific_listing(url):
+    """
+    Return False if a URL looks like a search results page, category page,
+    or other generic landing page rather than a specific item listing.
+    Return True if it looks like (or could plausibly be) a specific listing.
+    """
+    if not url:
+        return False
+    u = url.lower()
+
+    # eBay: valid item URLs contain /itm/; anything under /sch/ (search),
+    # /b/ (browse/category), /e/ (events), /str/ (stores), etc. is generic
+    if "ebay.com" in u:
+        if "/itm/" in u:
+            return True
+        # Anything on ebay.com that's NOT an item URL is a search/category/etc.
+        return False
+
+    # Facebook Marketplace: valid item URLs contain /marketplace/item/<id>
+    # Everything else (/marketplace/{city}/..., /marketplace/category/...,
+    # /marketplace/search/?query=...) is a search/browse/category page
+    if "facebook.com" in u:
+        if "/marketplace/item/" in u:
+            return True
+        if "/marketplace/" in u:
+            return False
+        # Facebook group posts are usable - superintendents post in private groups
+        if re.search(r"/groups/[^/]+/posts/\d+", u):
+            return True
+        if re.search(r"/groups/[^/]+/permalink/\d+", u):
+            return True
+        # Bare group landing or marketplace root - reject
+        if re.search(r"/marketplace/?$|/groups/[^/]+/?$", u):
+            return False
+        return True  # other FB URLs (pages, posts): give benefit of the doubt
+
+    # Craigslist: item URLs have a 10+ digit post ID and end in .html
+    if "craigslist.org" in u:
+        if re.search(r"/\d{10,}\.html", u):
+            return True
+        if "/search/" in u or "?query=" in u:
+            return False
+
+    # OfferUp: item URLs are /item/detail/<id>
+    if "offerup.com" in u:
+        if "/item/detail/" in u:
+            return True
+        return False
+
+    # Google: shouldn't hit this since we use SerpAPI, but guard anyway
+    if u.startswith("https://www.google.com/search") or u.startswith("https://google.com/search"):
+        return False
+
+    # Generic search-page indicators anywhere in the path
+    search_page_patterns = [
+        r"/search/?(?:\?|$)",
+        r"/sch/",
+        r"/category/",
+        r"/categories/",
+        r"/listings/?(?:\?|$)",
+        r"/browse/?(?:\?|$)",
+        r"/shop/?(?:\?|$)",
+        r"[?&]q=.+&",
+        r"/results/?(?:\?|$)",
+    ]
+    for pat in search_page_patterns:
+        if re.search(pat, u):
+            # Only allow through if there's a specific ID-like segment AFTER the category
+            # path, indicating drill-down to a specific item
+            if not re.search(
+                r"(?:/category/|/categories/|/search/|/sch/|/browse/|/shop/|/listings/|/results/)[^/]+/(?:\d{6,}|[a-z0-9\-]{15,})(?:/|$|\?|\.html)",
+                u,
+            ):
+                return False
+
+    # GovDeals: valid item URLs have fa=Main.Item
+    if "govdeals.com" in u and "fa=main.item" not in u and "/asset/" not in u:
+        # But category pages are fa=Main.AdvSearchResultsNew - reject
+        if "fa=main.advsearch" in u or "fa=main.category" in u:
+            return False
+
     return True
 
 
@@ -343,9 +465,15 @@ def _domain_of(url):
 
 
 def classify_listing_type(url, title, snippet, source):
-    """Return one of: 'auction', 'dealer', 'marketplace', 'classified', 'other'."""
+    """Return one of: 'golf_course', 'auction', 'dealer', 'marketplace', 'classified', 'other'."""
     domain = _domain_of(url)
     text = " ".join(filter(None, [title, snippet]))
+
+    # Golf course direct - check FIRST since these are the highest-value leads
+    # Domain signals: contains "golf", "cc" (country club), "club", "links",
+    # "countryclub", or turf-association TLDs
+    if _looks_like_golf_course_domain(domain):
+        return "golf_course"
 
     # Source-based shortcuts (high confidence)
     if source == "govdeals":
@@ -376,7 +504,60 @@ def classify_listing_type(url, title, snippet, source):
     return "other"
 
 
+def _looks_like_golf_course_domain(domain):
+    """Detect golf course / country club websites by domain pattern."""
+    if not domain:
+        return False
+
+    # Exclude the big aggregator/industry sites that have 'golf' in their name
+    # but aren't individual courses
+    BIG_GOLF_SITES = {
+        "golfwrx.com", "golfdigest.com", "golf.com", "pga.com", "pgatour.com",
+        "golfchannel.com", "mygolfspy.com", "golfclub-atlas.com", "golfweek.com",
+        "usga.org", "gcsaa.org", "golfcourseindustry.com", "golfbusiness.com",
+        "golfequipmenttrader.com",
+    }
+    if domain in BIG_GOLF_SITES:
+        return False
+
+    # Subdomains of those big sites also exclude
+    for big in BIG_GOLF_SITES:
+        if domain.endswith("." + big):
+            return False
+
+    # Strip TLD to get just the main domain part for substring matching
+    # e.g. "pinevalleygolfclub.com" -> "pinevalleygolfclub"
+    # e.g. "shop.oakvalleycc.com" -> "oakvalleycc"
+    main = domain.split(".")
+    if len(main) >= 2:
+        main_name = main[-2]  # second-to-last segment before TLD
+    else:
+        main_name = domain
+
+    # Token-based match for hyphen/dot separated domains
+    tokens = re.split(r"[.\-_]", domain)
+    if any(t in {"golf", "cc", "countryclub", "golfclub", "links", "golfcourse", "gc"}
+           for t in tokens):
+        return True
+
+    # Substring match in the main domain name for compound words:
+    # "pinevalleygolfclub", "torreypinesgolfcourse", "bandondunesgolf",
+    # "mygolfclub", "somecountryclub", etc.
+    if re.search(
+        r"golfclub|countryclub|golfcourse|golflinks|golf$|cc$",
+        main_name, re.I,
+    ):
+        return True
+
+    # Common TLD suffixes - .gc.com, .cc.com etc. (though rare)
+    if re.search(r"gc\.(?:com|org|net)$|cc\.(?:com|org|net)$", domain):
+        return True
+
+    return False
+
+
 LISTING_TYPE_LABELS = {
+    "golf_course": "⛳ Golf Course Direct",
     "auction":     "🔨 Auction",
     "dealer":      "🏪 Dealer / Reseller",
     "marketplace": "🛒 Marketplace",
@@ -384,7 +565,7 @@ LISTING_TYPE_LABELS = {
     "other":       "📰 Other",
 }
 
-LISTING_TYPE_ORDER = ["auction", "dealer", "marketplace", "classified", "other"]
+LISTING_TYPE_ORDER = ["golf_course", "auction", "dealer", "marketplace", "classified", "other"]
 
 
 # ============================================================================
@@ -567,6 +748,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
     for r in raw_results:
         texts = [r.get("title", ""), r.get("snippet", "")]
         if not is_relevant(*texts): continue
+        if not url_is_specific_listing(r.get("url", "")):
+            continue
         if not location_acceptable(r.get("title", ""), r.get("location", "")):
             continue
         r["brand"] = detect_brand(*texts)
@@ -948,6 +1131,21 @@ def render_lead_card(lead):
                     unsafe_allow_html=True,
                 )
 
+            # Show the domain prominently so user can triage at a glance
+            domain = _domain_of(lead.get("url", ""))
+            if domain:
+                # Truncate the URL path for readability
+                url_display = lead["url"]
+                if len(url_display) > 90:
+                    url_display = url_display[:87] + "…"
+                st.markdown(
+                    f'<div class="lead-meta" style="margin-top:6px;">'
+                    f'🔗 <span style="color:#9aa7b5;font-weight:500;">{html.escape(domain)}</span>'
+                    f' <span style="color:#5a6470;font-size:12px;">{html.escape(url_display)}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
             meta_parts = []
             if lead.get("price"):
                 meta_parts.append(f'<span class="lead-price">{html.escape(lead["price"])}</span>')
@@ -1033,13 +1231,16 @@ def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold
     toro = get_setting("toro_models", DEFAULT_TORO)
     jd = get_setting("jd_models", DEFAULT_JD)
     base_queries = get_setting("base_queries", DEFAULT_BASE_QUERIES)
+    golf_queries = get_setting("golf_course_queries", DEFAULT_GOLF_COURSE_QUERIES)
     subreddits = get_setting("subreddits", DEFAULT_SUBREDDITS)
     queries = build_queries(toro, jd, base_queries)
 
     all_results = []
     api_key = _get_secret("SERPAPI_KEY")
 
-    with st.status(f"Searching {len(queries)} queries across selected sources…", expanded=True) as status:
+    total_google = len(queries) + (len(golf_queries) if use_google and api_key else 0)
+    status_msg = f"Searching {total_google if use_google else len(queries)} queries across selected sources…"
+    with st.status(status_msg, expanded=True) as status:
         progress = st.progress(0.0)
 
         def cb(cur, tot, msg):
@@ -1050,10 +1251,17 @@ def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold
             if not api_key:
                 status.write("⚠️ Skipping Google — no SerpAPI key configured")
             else:
-                status.write(f"🔍 Searching Google for {len(queries)} queries…")
+                status.write(f"🔍 Searching Google for {len(queries)} standard queries…")
                 res = search_serpapi(queries, api_key, 20, cb)
                 status.write(f"  → {len(res)} raw Google results")
                 all_results.extend(res)
+
+                # Extra pass: golf-course-targeted Google queries
+                if golf_queries:
+                    status.write(f"⛳ Searching Google for {len(golf_queries)} golf-course-targeted queries…")
+                    res_golf = search_serpapi(golf_queries, api_key, 20, cb)
+                    status.write(f"  → {len(res_golf)} raw golf-course results")
+                    all_results.extend(res_golf)
 
         if use_ebay:
             status.write("🏷️ Searching eBay…")
@@ -1401,6 +1609,23 @@ with tab_settings:
         qs = [l.strip() for l in base_txt.splitlines() if l.strip()]
         set_setting("base_queries", qs)
         st.success(f"Saved {len(qs)} base queries")
+
+    st.divider()
+    st.markdown("#### ⛳ Golf course targeted queries (Google only)")
+    st.caption(
+        "These queries use Google dorks (site:, intitle:, quoted phrases) to find "
+        "classified sections on individual golf course websites. "
+        "**Only runs when Google source is enabled.** Each query = 1 SerpAPI search."
+    )
+    golf_txt = st.text_area(
+        "One per line",
+        "\n".join(get_setting("golf_course_queries", DEFAULT_GOLF_COURSE_QUERIES)),
+        height=200, key="golf_edit", label_visibility="collapsed",
+    )
+    if st.button("Save golf course queries"):
+        qs = [l.strip() for l in golf_txt.splitlines() if l.strip()]
+        set_setting("golf_course_queries", qs)
+        st.success(f"Saved {len(qs)} golf course queries")
 
     st.divider()
     st.markdown("#### Subreddits to monitor")
