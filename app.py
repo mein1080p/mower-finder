@@ -469,12 +469,17 @@ def classify_listing_type(url, title, snippet, source, seller=None):
     domain = _domain_of(url)
     text = " ".join(filter(None, [title, snippet]))
 
+    # Dealer/association scanner sources use "dealer/<kind>" prefix
+    if source and source.startswith("dealer/"):
+        kind = source.split("/", 1)[1] if "/" in source else ""
+        if kind == "gcsaa":
+            # GCSAA classifieds are members-only equipment exchanges, almost
+            # always direct from golf courses/superintendents
+            return "golf_course"
+        if kind in ("toro_dealer", "jd_dealer"):
+            return "dealer"
+
     # Golf course direct - check FIRST since these are the highest-value leads.
-    # Three signals, in order of reliability:
-    #   1. Seller name contains "Country Club", "Golf Club", "Golf Course", etc.
-    #      (from TurfNet) - THIS IS THE STRONGEST SIGNAL
-    #   2. Domain is an individual golf course website
-    #   3. Title/snippet mentions a specific golf course selling equipment
     if seller and _seller_is_golf_course(seller):
         return "golf_course"
     if _looks_like_golf_course_domain(domain):
@@ -914,13 +919,378 @@ def build_queries(toro_models, jd_models, base_queries):
     return queries
 
 
+# ============================================================================
+# Dealer & Association Scanner
+# ============================================================================
+# Two-phase scan:
+#   1. DISCOVER: visit each source's homepage, find the most likely "used
+#      inventory" or "classifieds" URL by scanning nav links and common paths.
+#   2. EXTRACT: fetch the discovered URL and pull out any text that mentions
+#      Toro Greensmaster or John Deere walking greens models.
+# The scanner records status for EVERY source so the user can see what worked
+# and what didn't, then manually override URLs for the failures.
+
+SOURCES_TABLE = "mower_sources"
+
+# Common URL path fragments that dealer/association sites use for used/classifieds
+DISCOVERY_PATH_HINTS = [
+    # Used equipment paths (dealers)
+    "/used-equipment", "/used-inventory", "/used", "/pre-owned", "/preowned",
+    "/used-turf", "/used-golf", "/used/turf", "/used/golf",
+    "/toro/used", "/john-deere/used", "/jd/used",
+    "/inventory/used", "/inventory/pre-owned",
+    "/equipment/used", "/equipment/pre-owned",
+    "/shop/used", "/shop/pre-owned",
+    "/commercial/used",
+    # Classifieds / marketplace paths (associations)
+    "/classifieds", "/classified", "/marketplace", "/for-sale",
+    "/equipment-exchange", "/equipment-for-sale", "/members/classifieds",
+    "/community/classifieds", "/resources/classifieds", "/buy-sell",
+]
+
+# Regex patterns for nav link text we want
+DISCOVERY_LINK_TEXT = re.compile(
+    r"used\s*(?:equipment|inventory|turf|golf|mowers?)|"
+    r"pre[-\s]?owned|preowned|"
+    r"classifieds?|for\s*sale|equipment\s*(?:exchange|for\s*sale)|"
+    r"buy[-\s]?sell|marketplace",
+    re.I,
+)
+
+
+def scanner_discover_inventory_url(homepage_url, progress_cb=None):
+    """
+    Visit homepage and try to find the most likely used-inventory URL.
+    Returns (url_or_none, status_string, note_string).
+    """
+    try:
+        r = requests.get(homepage_url, headers=HEADERS, timeout=20, allow_redirects=True)
+        if r.status_code == 403:
+            return None, "blocked", f"HTTP 403 — site blocks automated requests"
+        if r.status_code == 401:
+            return None, "login_required", f"HTTP 401 — requires login"
+        if r.status_code != 200:
+            return None, "fetch_error", f"HTTP {r.status_code}"
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        base = r.url  # use final URL after redirects
+
+        # Extract all anchor tags with href + text
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            text = a.get_text(" ", strip=True)
+            if not href or href.startswith("#") or href.startswith("mailto:") \
+                    or href.startswith("tel:") or href.startswith("javascript:"):
+                continue
+            candidates.append((href, text))
+
+        if not candidates:
+            return None, "no_inventory_page", "No links found on homepage"
+
+        # Score each candidate
+        from urllib.parse import urljoin
+        scored = []
+        for href, text in candidates:
+            abs_url = urljoin(base, href).split("#")[0]
+            score = 0
+            low_url = abs_url.lower()
+            low_text = (text or "").lower()
+
+            # Path hints (strong signal)
+            for hint in DISCOVERY_PATH_HINTS:
+                if hint in low_url:
+                    score += 10
+
+            # Link text match (strong signal)
+            if DISCOVERY_LINK_TEXT.search(low_text):
+                score += 8
+
+            # Bonus for combined signals
+            if score >= 10 and DISCOVERY_LINK_TEXT.search(low_text):
+                score += 5
+
+            # Penalize if link points to a non-HTML file
+            if re.search(r"\.(?:pdf|docx?|xlsx?|zip|jpg|png|gif)$", low_url):
+                score -= 20
+
+            # Penalize if link leaves the site
+            try:
+                from urllib.parse import urlparse
+                if urlparse(abs_url).netloc != urlparse(base).netloc:
+                    # GCSAA regional pages link to chapter sites — that's fine,
+                    # but deprioritize offsite for dealer sites
+                    score -= 3
+            except Exception:
+                pass
+
+            if score > 0:
+                scored.append((score, abs_url, text))
+
+        if not scored:
+            return None, "no_inventory_page", (
+                "Couldn't find a 'used equipment' or 'classifieds' link on the homepage"
+            )
+
+        # Pick best match
+        scored.sort(key=lambda x: -x[0])
+        best_score, best_url, best_text = scored[0]
+
+        return best_url, "ok", f"Found: '{best_text}' ({best_url})"
+
+    except requests.exceptions.Timeout:
+        return None, "fetch_error", "Timed out after 20s"
+    except requests.exceptions.ConnectionError as e:
+        return None, "fetch_error", f"Connection error: {str(e)[:100]}"
+    except Exception as e:
+        return None, "fetch_error", f"Error: {str(e)[:100]}"
+
+
+# Pattern to spot a walking greens mower mention in extracted text
+MOWER_MENTION_RX = re.compile(
+    r"greensmaster\s*(?:flex\s*)?(?:eflex\s*)?(?:\d{3,4})?|"
+    r"(?:john\s*deere|jd|deere)\s*(?:220|180|260)\s*(?:sl|e[-\s]?cut|ecut)|"
+    r"precisioncut\s*(?:180|220|260)|"
+    r"\b(?:220|180|260)\s*sl\b|"
+    r"\b(?:220|180)\s*e[-\s]?cut\b",
+    re.I,
+)
+
+
+def scanner_extract_listings(inventory_url, source_row, progress_cb=None):
+    """
+    Fetch the inventory URL and extract walking-greens-mower listings.
+    Returns (listings_list, status, note, raw_count, matched_count).
+    """
+    try:
+        r = requests.get(inventory_url, headers=HEADERS, timeout=25, allow_redirects=True)
+        if r.status_code != 200:
+            return [], "fetch_error", f"HTTP {r.status_code}", 0, 0
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Strategy: find all anchor tags and all product-card-like blocks
+        # containing mower keywords
+        candidates = []
+
+        # 1. Anchor-based: any link whose title/text mentions a mower model
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(" ", strip=True)
+            if not text or len(text) < 10:
+                continue
+            if MOWER_MENTION_RX.search(text):
+                href = a["href"].strip()
+                if href.startswith("#") or href.startswith("mailto:"):
+                    continue
+                from urllib.parse import urljoin
+                abs_url = urljoin(inventory_url, href).split("#")[0]
+                # Find a parent container to get price/context
+                container = a.find_parent(["article", "div", "li", "tr"])
+                ctx = container.get_text(" ", strip=True)[:400] if container else text
+                candidates.append({"title": text[:150], "url": abs_url, "snippet": ctx})
+
+        # 2. Card-based: common listing patterns
+        for card in soup.select(
+            "article, .product, .listing, .inventory-item, .card, "
+            ".equipment-item, .used-item, .item"
+        ):
+            card_text = card.get_text(" ", strip=True)
+            if not card_text or not MOWER_MENTION_RX.search(card_text):
+                continue
+            link = card.find("a", href=True)
+            if not link:
+                continue
+            href = link["href"].strip()
+            title = link.get_text(" ", strip=True) or card_text[:80]
+            if len(title) < 10:
+                title = card_text[:100]
+            from urllib.parse import urljoin
+            abs_url = urljoin(inventory_url, href).split("#")[0]
+            candidates.append({
+                "title": title[:150], "url": abs_url, "snippet": card_text[:400]
+            })
+
+        # Dedupe by URL
+        seen = set()
+        unique = []
+        for c in candidates:
+            if c["url"] in seen:
+                continue
+            seen.add(c["url"])
+            unique.append(c)
+
+        raw_count = len(unique)
+        if raw_count == 0:
+            return [], "no_mowers_found", (
+                f"Page fetched ok but no Toro Greensmaster / JD walking greens models mentioned"
+            ), 0, 0
+
+        # Extract price from snippet if possible
+        for c in unique:
+            price_match = re.search(r"\$[\d,]+(?:\.\d{2})?", c["snippet"])
+            if price_match:
+                c["price"] = price_match.group(0)
+
+        # Add source metadata
+        source_name = source_row.get("name", "Unknown dealer")
+        source_kind = source_row.get("kind", "other")
+        source_id = source_row.get("id")
+        for c in unique:
+            c["source"] = f"dealer/{source_kind}"
+            c["seller"] = source_name
+            c["dealer_source_id"] = source_id
+            c["query"] = f"direct scan: {source_name}"
+
+        return unique, "ok", f"Found {raw_count} candidate mower listings", raw_count, raw_count
+
+    except requests.exceptions.Timeout:
+        return [], "fetch_error", "Timed out after 25s", 0, 0
+    except Exception as e:
+        return [], "fetch_error", f"Error: {str(e)[:100]}", 0, 0
+
+
+def run_dealer_scan(progress_cb=None):
+    """
+    Full scan workflow:
+      1. Load all enabled sources
+      2. For each, discover or use existing inventory URL
+      3. Fetch inventory page and extract listings
+      4. Update source row with status
+      5. Return listings for enrichment
+    """
+    supa = get_supabase()
+    if supa is None:
+        return [], {}
+
+    try:
+        resp = supa.table(SOURCES_TABLE).select("*").eq("enabled", True).execute()
+        sources = resp.data or []
+    except Exception as e:
+        return [], {"error": f"Could not load sources: {e}"}
+
+    all_listings = []
+    summary = {"scanned": 0, "discovered": 0, "with_listings": 0, "errors": 0, "total_candidates": 0}
+
+    for i, src in enumerate(sources):
+        name = src.get("name", "?")
+        if progress_cb:
+            progress_cb(i, len(sources), f"{name}")
+
+        # Step 1: determine inventory URL
+        inventory_url = src.get("inventory_url_manual") or src.get("inventory_url")
+        discovery_status = None
+        discovery_note = None
+
+        if not inventory_url:
+            # Auto-discover
+            inventory_url, discovery_status, discovery_note = scanner_discover_inventory_url(
+                src["homepage_url"], progress_cb
+            )
+            if inventory_url:
+                summary["discovered"] += 1
+            else:
+                summary["errors"] += 1
+            time.sleep(1.5)  # Be polite
+
+        # Step 2: extract listings (if we have a URL)
+        listings = []
+        extract_status = None
+        extract_note = None
+        raw_count = 0
+        matched_count = 0
+
+        if inventory_url:
+            listings, extract_status, extract_note, raw_count, matched_count = \
+                scanner_extract_listings(inventory_url, src, progress_cb)
+            if listings:
+                all_listings.extend(listings)
+                summary["with_listings"] += 1
+                summary["total_candidates"] += len(listings)
+            time.sleep(1.5)
+
+        # Step 3: update source row with scan status
+        final_status = extract_status or discovery_status or "fetch_error"
+        final_note = extract_note or discovery_note or "unknown"
+        update_payload = {
+            "last_scan_at": datetime.now(timezone.utc).isoformat(),
+            "last_scan_status": final_status,
+            "last_scan_note": final_note[:500] if final_note else None,
+            "last_scan_raw_count": raw_count,
+            "last_scan_matched_count": matched_count,
+        }
+        # Persist auto-discovered URL if we found one
+        if inventory_url and not src.get("inventory_url") and not src.get("inventory_url_manual"):
+            update_payload["inventory_url"] = inventory_url
+
+        try:
+            supa.table(SOURCES_TABLE).update(update_payload).eq("id", src["id"]).execute()
+        except Exception:
+            pass  # don't let a stats update failure kill the whole scan
+
+        summary["scanned"] += 1
+
+    return all_listings, summary
+
+
+def fetch_sources(kind=None):
+    supa = get_supabase()
+    if supa is None:
+        return []
+    q = supa.table(SOURCES_TABLE).select("*")
+    if kind and kind != "All":
+        q = q.eq("kind", kind)
+    q = q.order("kind").order("name")
+    try:
+        return q.execute().data or []
+    except Exception:
+        return []
+
+
+def update_source(source_id, payload):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(SOURCES_TABLE).update(payload).eq("id", source_id).execute()
+    except Exception as e:
+        st.error(f"Update failed: {e}")
+
+
+def add_source(name, kind, homepage_url):
+    supa = get_supabase()
+    if supa is None:
+        return False, "No database connection"
+    try:
+        supa.table(SOURCES_TABLE).insert({
+            "name": name, "kind": kind, "homepage_url": homepage_url,
+        }).execute()
+        return True, "Added"
+    except Exception as e:
+        return False, str(e)
+
+
+def delete_source(source_id):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(SOURCES_TABLE).delete().eq("id", source_id).execute()
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+
 def enrich_and_store(raw_results, bulk_threshold=3):
     """Filter, enrich, and batch-upsert listings to Supabase."""
     enriched = []
     for r in raw_results:
         texts = [r.get("title", ""), r.get("snippet", "")]
         if not is_relevant(*texts): continue
-        if not url_is_specific_listing(r.get("url", "")):
+        # Dealer scan results come from trusted sources so skip the "is this a
+        # specific item URL" filter — dealer sites often don't have per-item
+        # pages and the listing text is what matters
+        source = r.get("source", "")
+        is_dealer_scan = source.startswith("dealer/")
+        if not is_dealer_scan and not url_is_specific_listing(r.get("url", "")):
             continue
         if not location_acceptable(r.get("title", ""), r.get("location", "")):
             continue
@@ -987,6 +1357,7 @@ def enrich_and_store(raw_results, bulk_threshold=3):
             "is_bulk": bool(r.get("is_bulk")),
             "listing_type": r.get("listing_type", "other"),
             "query": r.get("query"),
+            "dealer_source_id": r.get("dealer_source_id"),
         })
 
     if new_rows:
@@ -1570,6 +1941,15 @@ with st.sidebar:
     if last_search:
         st.caption(f"Last search: {format_date(last_search)}")
 
+    if st.button("🏪 Scan Dealers & Associations", use_container_width=True,
+                 help="Visit each dealer/association website and scrape their used inventory pages. "
+                      "Takes 6-10 minutes. Check the Dealers tab for per-source status."):
+        st.session_state.run_dealer_scan_clicked = True
+
+    last_dealer_scan = get_setting("last_dealer_scan")
+    if last_dealer_scan:
+        st.caption(f"Last dealer scan: {format_date(last_dealer_scan)}")
+
     with st.expander("📥 No leads yet?"):
         if st.button("Load demo data", use_container_width=True):
             new, bulk, _ = load_demo_data()
@@ -1598,6 +1978,42 @@ if st.session_state.get("run_search_clicked"):
                 f"{relevant} relevant listings matched but were already in your database."
             )
 
+if st.session_state.get("run_dealer_scan_clicked"):
+    st.session_state.run_dealer_scan_clicked = False
+    with st.status("Scanning dealers & associations… this takes 6-10 minutes.", expanded=True) as status:
+        progress = st.progress(0.0)
+        status.write("📋 Loading source list from Supabase…")
+
+        def scan_cb(cur, tot, msg):
+            frac = (cur + 1) / max(tot, 1)
+            progress.progress(min(frac, 1.0), text=f"[{cur+1}/{tot}] {msg[:80]}")
+
+        raw_listings, summary = run_dealer_scan(progress_cb=scan_cb)
+        status.write(f"✅ Scanned {summary.get('scanned', 0)} sources")
+        status.write(f"   {summary.get('discovered', 0)} discovered inventory URLs this run")
+        status.write(f"   {summary.get('with_listings', 0)} returned mower listings")
+        status.write(f"   {summary.get('total_candidates', 0)} candidate listings before filtering")
+
+        if raw_listings:
+            status.write(f"🧮 Running quality filters on {len(raw_listings)} candidates…")
+            new_count, bulk_new, relevant = enrich_and_store(raw_listings, bulk_threshold)
+            status.write(f"✅ {new_count} new leads saved ({bulk_new} flagged as bulk)")
+            status.write(f"   {len(raw_listings) - relevant} dropped by filters (non-walking, off-topic, etc.)")
+        else:
+            new_count = 0
+            bulk_new = 0
+
+        set_setting("last_dealer_scan", datetime.now(timezone.utc).isoformat())
+        status.update(
+            label=f"✅ Dealer scan done — {new_count} new leads ({bulk_new} bulk)",
+            state="complete", expanded=False,
+        )
+
+    if new_count > 0:
+        st.success(f"✅ Dealer scan added {new_count} new leads. Check the Dealers tab to see per-source status.")
+    else:
+        st.info("Dealer scan found no new listings. Check the **🏪 Dealers** tab below to see which sources worked and which need manual URLs.")
+
 stats = get_stats()
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Total leads", stats["total"])
@@ -1608,8 +2024,8 @@ c5.metric("Bulk · new", stats["bulk_new"])
 
 st.markdown("### ")
 
-tab_leads, tab_settings, tab_export, tab_help = st.tabs(
-    ["📋 Leads", "⚙️ Settings", "💾 Export", "❓ Help"]
+tab_leads, tab_dealers, tab_settings, tab_export, tab_help = st.tabs(
+    ["📋 Leads", "🏪 Dealers", "⚙️ Settings", "💾 Export", "❓ Help"]
 )
 
 
@@ -1747,6 +2163,172 @@ with tab_leads:
                     )
                     for lead in bucket:
                         render_lead_card(lead)
+
+
+# ---- DEALERS TAB ----
+with tab_dealers:
+    st.markdown("### Dealer & Association Registry")
+    st.caption(
+        "Every Toro/JD dealer and GCSAA association we monitor. Click **🏪 Scan Dealers** "
+        "in the sidebar to visit each one's used-inventory page and extract listings. "
+        "Below shows the latest scan status for each source."
+    )
+
+    # Filter bar
+    dc1, dc2, dc3 = st.columns([1.5, 1.5, 2])
+    kind_filter = dc1.selectbox(
+        "Type",
+        ["All", "toro_dealer", "jd_dealer", "gcsaa", "other"],
+        format_func=lambda k: {
+            "All": "All", "toro_dealer": "🔴 Toro Dealers",
+            "jd_dealer": "🟢 John Deere Dealers",
+            "gcsaa": "⛳ GCSAA Associations", "other": "Other",
+        }.get(k, k),
+    )
+    status_filter_d = dc2.selectbox(
+        "Scan status",
+        ["All", "ok", "no_inventory_page", "no_mowers_found", "fetch_error",
+         "blocked", "login_required", "never_scanned"],
+    )
+    search_d = dc3.text_input("Search by name", placeholder="e.g. United Ag")
+
+    sources = fetch_sources(kind=kind_filter if kind_filter != "All" else None)
+    # Client-side status filter
+    if status_filter_d != "All":
+        if status_filter_d == "never_scanned":
+            sources = [s for s in sources if not s.get("last_scan_at")]
+        else:
+            sources = [s for s in sources if s.get("last_scan_status") == status_filter_d]
+    if search_d:
+        low = search_d.lower()
+        sources = [s for s in sources if low in (s.get("name") or "").lower()]
+
+    # Summary
+    all_sources = fetch_sources()
+    st.markdown(
+        f"**{len(all_sources)}** total sources · "
+        f"🟢 **{sum(1 for s in all_sources if s.get('last_scan_status') == 'ok')}** with inventory "
+        f"· 🟡 **{sum(1 for s in all_sources if s.get('last_scan_status') in ('no_mowers_found', 'no_inventory_page'))}** no match "
+        f"· 🔴 **{sum(1 for s in all_sources if s.get('last_scan_status') in ('fetch_error', 'blocked', 'login_required'))}** errors "
+        f"· ⚪ **{sum(1 for s in all_sources if not s.get('last_scan_at'))}** never scanned"
+    )
+
+    # Add new source form
+    with st.expander("➕ Add a new dealer or association"):
+        ac1, ac2, ac3, ac4 = st.columns([2, 1.5, 2, 1])
+        new_name = ac1.text_input("Name", key="new_source_name", placeholder="e.g. ABC Turf Equipment")
+        new_kind = ac2.selectbox("Type", ["toro_dealer", "jd_dealer", "gcsaa", "other"],
+                                 key="new_source_kind")
+        new_url = ac3.text_input("Homepage URL", key="new_source_url", placeholder="https://example.com")
+        if ac4.button("Add", use_container_width=True):
+            if new_name and new_url:
+                ok, msg = add_source(new_name, new_kind, new_url)
+                if ok:
+                    st.success(f"Added {new_name}")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.error("Name and URL required")
+
+    st.caption(f"Showing {len(sources)} sources")
+
+    STATUS_ICONS = {
+        "ok": "🟢", "no_inventory_page": "🟡", "no_mowers_found": "🟡",
+        "fetch_error": "🔴", "blocked": "🔴", "login_required": "🔴",
+    }
+    STATUS_LABELS = {
+        "ok": "OK",
+        "no_inventory_page": "No inventory page found",
+        "no_mowers_found": "Inventory page found, no walking greens mowers matched",
+        "fetch_error": "Fetch error",
+        "blocked": "Blocked by site",
+        "login_required": "Requires login",
+    }
+
+    for src in sources:
+        status_key = src.get("last_scan_status") or "never_scanned"
+        icon = STATUS_ICONS.get(status_key, "⚪")
+        label = STATUS_LABELS.get(status_key, "Never scanned")
+
+        with st.container(border=True):
+            hc1, hc2, hc3 = st.columns([4, 2, 1])
+            with hc1:
+                st.markdown(
+                    f"**{icon} {html.escape(src['name'])}** · "
+                    f"<span style='color:#7a8694;'>{html.escape(src['kind'])}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"🏠 <a href='{html.escape(src['homepage_url'])}' target='_blank' "
+                    f"style='color:#7a8694;text-decoration:none;'>{html.escape(src['homepage_url'])}</a>",
+                    unsafe_allow_html=True,
+                )
+                inv_url = src.get("inventory_url_manual") or src.get("inventory_url")
+                if inv_url:
+                    inv_note = "(manual override)" if src.get("inventory_url_manual") else "(auto-detected)"
+                    st.markdown(
+                        f"📦 <a href='{html.escape(inv_url)}' target='_blank' style='color:#00c389;'>"
+                        f"{html.escape(inv_url)}</a> "
+                        f"<span style='color:#7a8694;font-size:12px;'>{inv_note}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+            with hc2:
+                st.markdown(
+                    f"**Status:** {label}<br>"
+                    f"<span style='color:#7a8694;font-size:12px;'>"
+                    f"Last scan: {format_date(src['last_scan_at']) if src.get('last_scan_at') else 'never'}<br>"
+                    f"Candidates found: {src.get('last_scan_raw_count', 0)}"
+                    f"</span>",
+                    unsafe_allow_html=True,
+                )
+                if src.get("last_scan_note"):
+                    st.caption(src["last_scan_note"][:200])
+
+            with hc3:
+                enabled = bool(src.get("enabled", True))
+                new_enabled = st.checkbox("Enabled", value=enabled, key=f"en_{src['id']}",
+                                          label_visibility="visible")
+                if new_enabled != enabled:
+                    update_source(src["id"], {"enabled": new_enabled})
+                    st.rerun()
+
+            # Expandable section for manual URL override and delete
+            with st.expander("⚙️ Configure / manually set inventory URL"):
+                st.caption(
+                    "If auto-discovery couldn't find the used-equipment page, paste the correct URL here. "
+                    "Example: `https://example-dealer.com/used-turf-equipment/`"
+                )
+                cur_manual = src.get("inventory_url_manual") or ""
+                new_manual = st.text_input(
+                    "Manual inventory URL (overrides auto-detection)",
+                    value=cur_manual, key=f"man_{src['id']}",
+                    placeholder="https://dealer.com/used-equipment/",
+                )
+                mc1, mc2, mc3 = st.columns(3)
+                if mc1.button("Save URL", key=f"savem_{src['id']}", use_container_width=True):
+                    update_source(src["id"], {
+                        "inventory_url_manual": new_manual.strip() or None,
+                        "last_scan_status": None,  # force rescan
+                    })
+                    st.success("Saved — will be used on next scan")
+                    time.sleep(0.5)
+                    st.rerun()
+                if mc2.button("Clear auto-discovered URL", key=f"clrauto_{src['id']}", use_container_width=True):
+                    update_source(src["id"], {"inventory_url": None, "last_scan_status": None})
+                    st.success("Cleared — will re-discover next scan")
+                    time.sleep(0.5)
+                    st.rerun()
+                if mc3.button("🗑️ Delete source", key=f"delsrc_{src['id']}", use_container_width=True):
+                    if st.session_state.get(f"confirm_delsrc_{src['id']}"):
+                        delete_source(src["id"])
+                        st.session_state.pop(f"confirm_delsrc_{src['id']}", None)
+                        st.rerun()
+                    else:
+                        st.session_state[f"confirm_delsrc_{src['id']}"] = True
+                        st.warning("Click Delete again to confirm")
 
 
 # ---- SETTINGS TAB ----
