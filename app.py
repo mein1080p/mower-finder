@@ -464,16 +464,26 @@ def _domain_of(url):
         return ""
 
 
-def classify_listing_type(url, title, snippet, source):
+def classify_listing_type(url, title, snippet, source, seller=None):
     """Return one of: 'golf_course', 'auction', 'dealer', 'marketplace', 'classified', 'other'."""
     domain = _domain_of(url)
     text = " ".join(filter(None, [title, snippet]))
 
-    # Golf course direct - check FIRST since these are the highest-value leads
-    # Domain signals: contains "golf", "cc" (country club), "club", "links",
-    # "countryclub", or turf-association TLDs
+    # Golf course direct - check FIRST since these are the highest-value leads.
+    # Three signals, in order of reliability:
+    #   1. Seller name contains "Country Club", "Golf Club", "Golf Course", etc.
+    #      (from TurfNet) - THIS IS THE STRONGEST SIGNAL
+    #   2. Domain is an individual golf course website
+    #   3. Title/snippet mentions a specific golf course selling equipment
+    if seller and _seller_is_golf_course(seller):
+        return "golf_course"
     if _looks_like_golf_course_domain(domain):
         return "golf_course"
+
+    # TurfNet listings - if not already classified as golf_course via seller,
+    # they're treated as classified (still valuable but not course-direct)
+    if source == "turfnet":
+        return "classified"
 
     # Source-based shortcuts (high confidence)
     if source == "govdeals":
@@ -502,6 +512,45 @@ def classify_listing_type(url, title, snippet, source):
         return "dealer"
 
     return "other"
+
+
+def _seller_is_golf_course(seller):
+    """Detect if a seller/poster name indicates an individual golf course/country club."""
+    if not seller:
+        return False
+    s = seller.lower()
+    # Patterns that indicate a specific course, NOT an equipment dealer
+    course_indicators = [
+        r"\bcountry\s*club\b",
+        r"\bgolf\s*club\b",
+        r"\bgolf\s*course\b",
+        r"\bgolf\s*resort\b",
+        r"\blinks\s*(?:at|of)\b",
+        r"\bg\.?\s*c\.?\b(?!\s*turf)",  # "GC" but not "GC Turf"
+        r"\bc\.?\s*c\.?\b(?!\s*turf)",  # "CC" but not "CC Turf"
+        # "X Golf" as the ending (e.g. "Rio Pinar Golf", "Pebble Beach Golf")
+        # — but only if no other commercial term preceded
+        r"^(?:[A-Z][a-zA-Z]+\s+){1,3}Golf\s*$",
+    ]
+    # Skip if it's clearly an equipment dealer/reseller
+    dealer_excludes = [
+        r"turf\s*equipment",
+        r"turf\s*supply",
+        r"reel\s*(?:sharp|mowers|services)",
+        r"\bllc\b.*\b(?:equipment|supply|mowers|turf|reel)\b",
+        r"\b(?:equipment|supply|mowers|turf|reel)\b.*\bllc\b",
+        r"statewide\s*turf",
+        r"general\s*turf",
+        r"cutting\s*green",
+        r"western\s*turf",
+    ]
+    for pat in dealer_excludes:
+        if re.search(pat, s, re.I):
+            return False
+    for pat in course_indicators:
+        if re.search(pat, s, re.I):
+            return True
+    return False
 
 
 def _looks_like_golf_course_domain(domain):
@@ -735,6 +784,129 @@ def search_reddit(queries, subreddits, ua, progress_cb=None):
     return out
 
 
+def search_turfnet(max_pages=3, exclude_own_listings=True, progress_cb=None):
+    """
+    Scrape TurfNet's Walk Greensmower classifieds category (in_cat=631).
+    These are direct-from-superintendent and direct-from-dealer listings,
+    and the seller name tells us if it's a golf course directly.
+
+    Publicly accessible - no login needed.
+    """
+    out = []
+    base = "https://turfnet.com/classifieds/"
+
+    for page in range(1, max_pages + 1):
+        if progress_cb: progress_cb(page - 1, max_pages, f"TurfNet walk-greensmower page {page}")
+        try:
+            if page == 1:
+                url = f"{base}?in_cat=631&directory_type=equipment"
+            else:
+                url = f"{base}page/{page}/?directory_type=equipment&in_cat=631"
+
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Each listing is an H2 with a link to /directory/equipment/<slug>/
+            listing_links = soup.select('h2 a[href*="/directory/equipment/"]')
+            if not listing_links:
+                # Fallback selector
+                listing_links = soup.select('a[href*="/directory/equipment/"]')
+
+            seen_urls_this_page = set()
+            for link in listing_links:
+                href = link.get("href", "")
+                if not href or href in seen_urls_this_page:
+                    continue
+                seen_urls_this_page.add(href)
+
+                # Normalize URL
+                if href.startswith("/"):
+                    href = "https://turfnet.com" + href
+
+                title = link.get_text(" ", strip=True)
+                if not title or len(title) < 5:
+                    continue
+
+                # Find the parent container to extract price, seller, location
+                container = link.find_parent(["article", "div", "li"])
+                price = None
+                location = None
+                seller = None
+                if container:
+                    # Price is usually a dollar amount near the title
+                    price_match = re.search(r"\$[\d,]+(?:\.\d{2})?", container.get_text())
+                    if price_match:
+                        price = price_match.group(0)
+
+                    # Location and seller appear after the title in list items
+                    # Typical format: $X.00 Location Name, State Seller Name count
+                    text_blob = container.get_text(" ", strip=True)
+                    # Try to extract a "City, State" pattern
+                    loc_match = re.search(
+                        r"([A-Z][a-zA-Z\s]+),\s*(Alabama|Alaska|Arizona|Arkansas|California|"
+                        r"Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|"
+                        r"Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|"
+                        r"Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|"
+                        r"New Hampshire|New Jersey|New Mexico|New York|North Carolina|"
+                        r"North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|"
+                        r"South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|"
+                        r"Washington|West Virginia|Wisconsin|Wyoming)",
+                        text_blob,
+                    )
+                    if loc_match:
+                        location = f"{loc_match.group(1).strip()}, {loc_match.group(2)}"
+
+                    # Seller name: look for company-like strings after the location
+                    # e.g. "General Turf Equipment LLC", "Bryn Mawr Country Club", "usedreelmowers.com"
+                    # These tend to appear right after the location in a paragraph
+                    for p_el in container.select("p, .listing-author, .author, .seller"):
+                        p_text = p_el.get_text(" ", strip=True)
+                        # Skip if it's the price/location line
+                        if "$" in p_text and len(p_text) < 100:
+                            continue
+                        # Look for common seller patterns
+                        for line in p_text.split("\n"):
+                            line = line.strip()
+                            if re.search(
+                                r"(?:LLC|Inc|Country\s*Club|Golf\s*Club|Golf\s*Course|"
+                                r"Turf|Equipment|Greens|Reels?|usedreelmowers)",
+                                line, re.I,
+                            ):
+                                seller = line[:80]
+                                break
+                        if seller:
+                            break
+
+                # Skip user's own listings
+                if exclude_own_listings and seller and "usedreelmowers" in seller.lower():
+                    continue
+                if exclude_own_listings and "usedreelmowers" in title.lower():
+                    continue
+
+                # Build snippet from seller + title
+                snippet_parts = []
+                if seller: snippet_parts.append(f"Seller: {seller}")
+                snippet = " · ".join(snippet_parts)
+
+                out.append({
+                    "source": "turfnet",
+                    "title": title,
+                    "url": href.split("?")[0].split("#")[0],
+                    "snippet": snippet,
+                    "price": price,
+                    "location": location,
+                    "seller": seller,  # used by classifier
+                    "query": "turfnet walk greensmower",
+                })
+
+            time.sleep(1.5)
+        except Exception as e:
+            if progress_cb: progress_cb(page - 1, max_pages, f"TurfNet error p{page}: {e}")
+    return out
+
+
 def build_queries(toro_models, jd_models, base_queries):
     queries = list(base_queries)
     queries.extend(f"used Toro {m} for sale" for m in toro_models)
@@ -758,7 +930,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
         has_hint = bool(BULK_HINT_RX.search(" ".join(texts).lower()))
         r["is_bulk"] = r["quantity"] >= bulk_threshold or has_hint
         r["listing_type"] = classify_listing_type(
-            r.get("url", ""), r.get("title", ""), r.get("snippet", ""), r.get("source", "")
+            r.get("url", ""), r.get("title", ""), r.get("snippet", ""),
+            r.get("source", ""), r.get("seller"),
         )
         r["fingerprint"] = fingerprint_listing(r["url"], r["title"])
         enriched.append(r)
@@ -1227,7 +1400,7 @@ def render_lead_card(lead):
 # Search runner
 # ============================================================================
 
-def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold):
+def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, use_turfnet, bulk_threshold):
     toro = get_setting("toro_models", DEFAULT_TORO)
     jd = get_setting("jd_models", DEFAULT_JD)
     base_queries = get_setting("base_queries", DEFAULT_BASE_QUERIES)
@@ -1239,7 +1412,7 @@ def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold
     api_key = _get_secret("SERPAPI_KEY")
 
     total_google = len(queries) + (len(golf_queries) if use_google and api_key else 0)
-    status_msg = f"Searching {total_google if use_google else len(queries)} queries across selected sources…"
+    status_msg = f"Searching across selected sources…"
     with st.status(status_msg, expanded=True) as status:
         progress = st.progress(0.0)
 
@@ -1282,6 +1455,12 @@ def run_search_ui(use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold
                 "mower-finder/1.0 (by usedreelmowers.com)", cb,
             )
             status.write(f"  → {len(res)} raw Reddit results")
+            all_results.extend(res)
+
+        if use_turfnet:
+            status.write("⛳ Searching TurfNet Walk Greensmower classifieds…")
+            res = search_turfnet(max_pages=3, exclude_own_listings=True, progress_cb=cb)
+            status.write(f"  → {len(res)} raw TurfNet results")
             all_results.extend(res)
 
         status.write("🧮 Filtering and saving to Supabase…")
@@ -1372,6 +1551,9 @@ with st.sidebar:
                                help="Government surplus — municipal courses retiring fleets")
     use_reddit = st.checkbox("💬 Reddit", value=True,
                              help="r/golfcourse, r/turfgrass, etc.")
+    use_turfnet = st.checkbox("⛳ TurfNet Classifieds", value=True,
+                              help="Direct-from-golf-course and direct-from-dealer listings. "
+                                   "The Walk Greensmower category is public and doesn't need login.")
 
     st.divider()
     st.subheader("Detection")
@@ -1402,11 +1584,11 @@ with st.sidebar:
 
 if st.session_state.get("run_search_clicked"):
     st.session_state.run_search_clicked = False
-    if not (use_google or use_ebay or use_govdeals or use_reddit):
+    if not (use_google or use_ebay or use_govdeals or use_reddit or use_turfnet):
         st.error("Enable at least one source in the sidebar.")
     else:
         new, bulk, relevant = run_search_ui(
-            use_google, use_ebay, use_govdeals, use_reddit, bulk_threshold
+            use_google, use_ebay, use_govdeals, use_reddit, use_turfnet, bulk_threshold
         )
         if new > 0:
             st.success(f"✅ {new} new listings found, {bulk} are bulk sellers")
