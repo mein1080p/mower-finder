@@ -45,12 +45,22 @@ st.markdown("""
     .badge-jd { background: #367c2b; color: #fff; }
     .badge-mixed { background: #888; color: #fff; }
     .badge-bulk { background: #ff6b35; color: #000; }
+    .badge-star { background: #ffc107; color: #000; }
+    .badge-type { background: #2a3240; color: #9aa7b5; border: 1px solid #3a4250; }
     .big-qty { font-size: 32px; font-weight: 800; color: #ff6b35; line-height: 1; }
     .lead-title a { color: #e4e7eb; text-decoration: none; font-weight: 600; }
     .lead-title a:hover { color: #00c389; }
     .lead-meta { color: #7a8694; font-size: 13px; }
     .lead-price { color: #00c389; font-weight: 600; }
     div[data-testid="stMetricValue"] { color: #00c389; }
+    .category-header {
+        font-size: 18px; font-weight: 700; color: #e4e7eb;
+        padding: 16px 0 8px 0; border-bottom: 1px solid #2a3240;
+        margin: 24px 0 12px 0;
+    }
+    .category-header .count {
+        color: #7a8694; font-weight: 400; font-size: 14px; margin-left: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -281,6 +291,147 @@ def location_acceptable(title, location):
 
 
 # ============================================================================
+# Listing type classifier (auction / dealer / marketplace / classified / other)
+# ============================================================================
+
+# Known auction-type domains and phrases
+AUCTION_DOMAINS = {
+    "govdeals.com", "publicsurplus.com", "bidspotter.com", "proxibid.com",
+    "hibid.com", "liveauctioneers.com", "auctionzip.com", "equipmentfacts.com",
+    "ironplanet.com", "ritchiebros.com", "rbauction.com", "allsurplus.com",
+    "municibid.com", "purplewave.com",
+}
+AUCTION_TITLE_RX = re.compile(
+    r"\bauction\b|\bbid(?:ding)?\b|\bestate\s*sale\b|\bsurplus\b|"
+    r"\bsheriff['s]*\s*sale\b|\bliquidation\s*auction\b", re.I,
+)
+
+# Marketplace-style domains (open listings, fixed-price or best-offer)
+MARKETPLACE_DOMAINS = {
+    "ebay.com", "ebay.co.uk", "facebook.com", "craigslist.org",
+    "offerup.com", "mercari.com", "letgo.com", "shopgoodwill.com",
+    "equipmenttrader.com", "machinerytrader.com", "tractorhouse.com",
+    "golfequipmenttrader.com",
+}
+
+# Dealer/reseller indicators in titles or domain structure
+DEALER_TITLE_RX = re.compile(
+    r"\b(dealer|dealership|authorized\s*(?:toro|john\s*deere)|turf\s*(?:equipment|supply)|"
+    r"golf\s*(?:equipment|supply)|outdoor\s*power\s*(?:equipment|supply)|"
+    r"used\s*equipment\s*sales|reconditioned|refurbished|inventory|"
+    r"our\s*(?:fleet|inventory|stock))\b",
+    re.I,
+)
+
+# Forum / classified / community post indicators
+CLASSIFIED_DOMAINS = {
+    "reddit.com", "turfnetwork.com", "turfnet.com", "golfwrx.com",
+    "lawnsite.com", "plowsite.com", "tractorbynet.com", "mytractorforum.com",
+    "golfclub-atlas.com",
+}
+
+
+def _domain_of(url):
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def classify_listing_type(url, title, snippet, source):
+    """Return one of: 'auction', 'dealer', 'marketplace', 'classified', 'other'."""
+    domain = _domain_of(url)
+    text = " ".join(filter(None, [title, snippet]))
+
+    # Source-based shortcuts (high confidence)
+    if source == "govdeals":
+        return "auction"
+    if source and source.startswith("reddit/"):
+        return "classified"
+    if source == "ebay":
+        return "marketplace"
+
+    # Domain-based classification (very reliable)
+    if any(d in domain for d in AUCTION_DOMAINS):
+        return "auction"
+    if any(d in domain for d in MARKETPLACE_DOMAINS):
+        return "marketplace"
+    if any(d in domain for d in CLASSIFIED_DOMAINS):
+        return "classified"
+
+    # Text-based classification (less reliable, but useful for unknown domains)
+    if AUCTION_TITLE_RX.search(text):
+        return "auction"
+    if DEALER_TITLE_RX.search(text):
+        return "dealer"
+
+    # Heuristic: domains with "dealer", "turf", "equipment", "supply" in them
+    if re.search(r"dealer|turf|equipment|supply|golf[\w-]*pro|mower", domain, re.I):
+        return "dealer"
+
+    return "other"
+
+
+LISTING_TYPE_LABELS = {
+    "auction":     "🔨 Auction",
+    "dealer":      "🏪 Dealer / Reseller",
+    "marketplace": "🛒 Marketplace",
+    "classified":  "💬 Classified / Forum",
+    "other":       "📰 Other",
+}
+
+LISTING_TYPE_ORDER = ["auction", "dealer", "marketplace", "classified", "other"]
+
+
+# ============================================================================
+# Model extraction (for filtering)
+# ============================================================================
+
+# Pre-compiled per-model regexes. The idea: extract which *specific model* a
+# listing is about, so the user can filter by it. Order matters — more specific
+# patterns (e.g. "Flex 1820") must come before general ones (e.g. "Greensmaster").
+MODEL_PATTERNS = [
+    # Toro specific models
+    ("Toro Greensmaster Flex 1820",    re.compile(r"greensmaster\s*flex\s*1820|\bflex\s*1820\b", re.I)),
+    ("Toro Greensmaster Flex 2120",    re.compile(r"greensmaster\s*flex\s*2120|\bflex\s*2120\b", re.I)),
+    ("Toro Greensmaster Flex 21",      re.compile(r"greensmaster\s*flex\s*21\b|\bflex\s*21\b", re.I)),
+    ("Toro Greensmaster eFlex 1021",   re.compile(r"eflex\s*1021\b", re.I)),
+    ("Toro Greensmaster eFlex 1800",   re.compile(r"eflex\s*1800\b", re.I)),
+    ("Toro Greensmaster eFlex 2100",   re.compile(r"eflex\s*2100\b", re.I)),
+    ("Toro Greensmaster eFlex 2120",   re.compile(r"eflex\s*2120\b", re.I)),
+    ("Toro Greensmaster eFlex",        re.compile(r"\beflex\b", re.I)),
+    ("Toro Greensmaster 1000",         re.compile(r"greensmaster\s*1000\b|\bgm\s*1000\b", re.I)),
+    ("Toro Greensmaster 1600",         re.compile(r"greensmaster\s*1600\b|\bgm\s*1600\b", re.I)),
+    ("Toro Greensmaster 800",          re.compile(r"greensmaster\s*800\b|\bgm\s*800\b", re.I)),
+    ("Toro Greensmaster (other)",      re.compile(r"greensmaster|\btoro\b.*\bgreens\b", re.I)),
+    # John Deere specific models
+    ("JD 220 E-Cut",                   re.compile(r"\b220\s*e[-\s]?cut\b", re.I)),
+    ("JD 180 E-Cut",                   re.compile(r"\b180\s*e[-\s]?cut\b", re.I)),
+    ("JD 220SL",                       re.compile(r"\b220\s*sl\b", re.I)),
+    ("JD 260SL",                       re.compile(r"\b260\s*sl\b", re.I)),
+    ("JD 180SL",                       re.compile(r"\b180\s*sl\b", re.I)),
+    ("JD PrecisionCut 180",            re.compile(r"precisioncut\s*180\b", re.I)),
+    ("JD PrecisionCut 220",            re.compile(r"precisioncut\s*220\b", re.I)),
+    ("JD PrecisionCut 260",            re.compile(r"precisioncut\s*260\b", re.I)),
+    ("JD PrecisionCut (other)",        re.compile(r"precisioncut", re.I)),
+    ("JD E-Cut (other)",               re.compile(r"e[-\s]?cut", re.I)),
+    ("JD (other)",                     re.compile(r"john\s*deere|\bjd\b|\bdeere\b", re.I)),
+]
+
+
+def detect_model(*texts):
+    blob = " ".join(t for t in texts if t)
+    for name, pat in MODEL_PATTERNS:
+        if pat.search(blob):
+            return name
+    return "Unknown model"
+
+
+# ============================================================================
 # Source adapters
 # ============================================================================
 
@@ -423,6 +574,9 @@ def enrich_and_store(raw_results, bulk_threshold=3):
         r["quantity"] = extract_quantity(*texts)
         has_hint = bool(BULK_HINT_RX.search(" ".join(texts).lower()))
         r["is_bulk"] = r["quantity"] >= bulk_threshold or has_hint
+        r["listing_type"] = classify_listing_type(
+            r.get("url", ""), r.get("title", ""), r.get("snippet", ""), r.get("source", "")
+        )
         r["fingerprint"] = fingerprint_listing(r["url"], r["title"])
         enriched.append(r)
 
@@ -475,6 +629,7 @@ def enrich_and_store(raw_results, bulk_threshold=3):
             "brand": r.get("brand", "unknown"),
             "quantity": int(r.get("quantity", 1)),
             "is_bulk": bool(r.get("is_bulk")),
+            "listing_type": r.get("listing_type", "other"),
             "query": r.get("query"),
         })
 
@@ -492,24 +647,36 @@ def enrich_and_store(raw_results, bulk_threshold=3):
 
 def load_demo_data():
     demos = [
-        {"source": "google", "title": "Liquidation sale: fleet of 6 Toro Greensmaster 1600 walk behind greens mowers",
-         "url": "https://example.com/sale-123", "snippet": "Course closing, must sell entire fleet of six Greensmaster walking greens mowers. Serviced annually.",
-         "price": "$12,000 each", "location": "Scottsdale, AZ", "query": "fleet of greens mowers"},
+        # Auction-type
+        {"source": "govdeals", "title": "3 John Deere 220 E-Cut Walking Greens Mowers - Municipal Golf Course",
+         "url": "https://govdeals.com/itm/2222", "snippet": "Three JD 220 E-Cut mowers from city golf course. Auction ends Friday.",
+         "price": "$4,200", "location": "Dayton, OH", "query": "John Deere 220 E-Cut"},
+        {"source": "google", "title": "Estate sale auction: Complete fleet of Toro Greensmaster 1600",
+         "url": "https://bidspotter.com/auction/4567", "snippet": "Estate auction of closed golf course, 6 Greensmaster 1600 units, all serviced.",
+         "price": "Starting bid $8,000", "location": "Scottsdale, AZ", "query": "golf course auction"},
+        # Dealer-type
+        {"source": "google", "title": "Used Toro Greensmaster 1000 - Reconditioned | Turf Equipment USA",
+         "url": "https://turfequipmentusa.com/inventory/toro-1000",
+         "snippet": "Our inventory includes 4 reconditioned Greensmaster 1000 units. Authorized Toro dealer.",
+         "price": "$6,500 each", "location": "Dallas, TX", "query": "Toro Greensmaster 1000"},
+        {"source": "google", "title": "John Deere 220SL Walk Greens Mower | SouthEast Turf Supply",
+         "url": "https://southeastturfsupply.com/listings/jd-220sl",
+         "snippet": "Single JD 220SL in excellent shape, low hours. Authorized JD dealer.",
+         "price": "$5,800", "location": "Charleston, SC", "query": "John Deere 220SL"},
+        # Marketplace-type
         {"source": "ebay", "title": "(4) Toro Greensmaster Flex 1820 Walk Behind Reel Greens Mower",
          "url": "https://ebay.com/itm/1111", "snippet": "4 units available, all functional",
          "price": "$8,500", "location": "Orlando, FL", "query": "Toro Greensmaster Flex 1820"},
-        {"source": "govdeals", "title": "3 John Deere 220 E-Cut Walking Greens Mowers - Municipal Golf Course",
-         "url": "https://govdeals.com/itm/2222", "snippet": "Three JD 220 E-Cut mowers from city golf course",
-         "price": "$4,200", "location": "Dayton, OH", "query": "John Deere 220 E-Cut"},
-        {"source": "reddit/golfcourse", "title": "Anyone know a buyer for two Toro Greensmaster 1000s?",
-         "url": "https://reddit.com/r/golfcourse/p3", "snippet": "We have 2 Greensmaster 1000 units retiring this spring",
-         "price": None, "location": None, "query": "Toro Greensmaster 1000"},
-        {"source": "google", "title": "Used John Deere 220SL walking greens mower - single unit",
-         "url": "https://example.com/jd-220sl", "snippet": "Single JD 220SL in excellent shape, low hours",
-         "price": "$5,800", "location": "Charleston, SC", "query": "John Deere 220SL"},
         {"source": "ebay", "title": "Toro Greensmaster eFlex 1021 Lithium Battery Walking Greens Mower",
          "url": "https://ebay.com/itm/3333", "snippet": "Modern electric walking greens mower, single unit",
          "price": "$9,900", "location": "Dallas, TX", "query": "Toro Greensmaster eFlex"},
+        # Classified/forum-type
+        {"source": "reddit/golfcourse", "title": "Anyone know a buyer for two Toro Greensmaster 1000s?",
+         "url": "https://reddit.com/r/golfcourse/p3", "snippet": "We have 2 Greensmaster 1000 units retiring this spring",
+         "price": None, "location": None, "query": "Toro Greensmaster 1000"},
+        {"source": "reddit/turfgrass", "title": "Superintendent selling fleet of 5 JD PrecisionCut 180",
+         "url": "https://reddit.com/r/turfgrass/p4", "snippet": "Retiring 5 PrecisionCut 180 units this fall, reasonable offers considered.",
+         "price": None, "location": "Austin, TX", "query": "John Deere PrecisionCut 180"},
     ]
     return enrich_and_store(demos, bulk_threshold=3)
 
@@ -518,25 +685,59 @@ def load_demo_data():
 # Data access (Supabase reads)
 # ============================================================================
 
-def fetch_listings(bulk_only=False, brand=None, status=None, days=None, search=None, limit=500):
+def fetch_listings(bulk_only=False, starred_only=False, brand=None, status=None,
+                   listing_type=None, source=None, days=None, search=None,
+                   sort="smart", limit=1000):
+    """
+    Query listings with rich filters and sort options.
+
+    sort:
+      - "smart"    : starred first, bulk first, then newest (default)
+      - "newest"   : first_seen desc
+      - "oldest"   : first_seen asc
+      - "quantity" : quantity desc, then newest
+      - "bulk"     : bulk first, then quantity desc, then newest
+    """
     supa = get_supabase()
     if supa is None:
         return []
     q = supa.table(LISTINGS_TABLE).select("*")
+
     if bulk_only:
         q = q.eq("is_bulk", True)
+    if starred_only:
+        q = q.eq("starred", True)
     if brand and brand not in ("All", None):
         q = q.eq("brand", brand)
     if status and status not in ("All", None):
         q = q.eq("status", status)
+    if listing_type and listing_type not in ("All", None):
+        # Match by auto-detected type (override column compared client-side)
+        q = q.eq("listing_type", listing_type)
+    if source and source not in ("All", None):
+        q = q.eq("source", source)
     if days:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         q = q.gte("first_seen", cutoff)
     if search:
-        # Postgrest `or` filter: sanitize commas/parens that would break the syntax
         safe = search.replace(",", " ").replace("(", " ").replace(")", " ")
         q = q.or_(f"title.ilike.%{safe}%,snippet.ilike.%{safe}%")
-    q = q.order("is_bulk", desc=True).order("first_seen", desc=True).limit(limit)
+
+    # Sort
+    if sort == "newest":
+        q = q.order("first_seen", desc=True)
+    elif sort == "oldest":
+        q = q.order("first_seen", desc=False)
+    elif sort == "quantity":
+        q = q.order("quantity", desc=True).order("first_seen", desc=True)
+    elif sort == "bulk":
+        q = q.order("is_bulk", desc=True).order("quantity", desc=True).order("first_seen", desc=True)
+    else:  # smart
+        q = (q.order("starred", desc=True)
+              .order("is_bulk", desc=True)
+              .order("first_seen", desc=True))
+
+    q = q.limit(limit)
     try:
         return q.execute().data or []
     except Exception as e:
@@ -580,6 +781,7 @@ def get_stats():
     return {
         "total":      count(t.select("id", count="exact", head=True)),
         "bulk_total": count(t.select("id", count="exact", head=True).eq("is_bulk", True)),
+        "starred":    count(t.select("id", count="exact", head=True).eq("starred", True)),
         "new_count":  count(t.select("id", count="exact", head=True).eq("status", "new")),
         "bulk_new":   count(t.select("id", count="exact", head=True).eq("is_bulk", True).eq("status", "new")),
     }
@@ -596,6 +798,85 @@ def update_listing_status(listing_id, new_status, notes=None):
         supa.table(LISTINGS_TABLE).update(payload).eq("id", listing_id).execute()
     except Exception as e:
         st.error(f"Status update failed: {e}")
+
+
+def toggle_star(listing_id, starred):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(LISTINGS_TABLE).update({"starred": bool(starred)}).eq("id", listing_id).execute()
+    except Exception as e:
+        st.error(f"Star update failed: {e}")
+
+
+def delete_listing(listing_id):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(LISTINGS_TABLE).delete().eq("id", listing_id).execute()
+    except Exception as e:
+        st.error(f"Delete failed: {e}")
+
+
+def update_listing_notes(listing_id, notes):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(LISTINGS_TABLE).update({"notes": notes}).eq("id", listing_id).execute()
+    except Exception as e:
+        st.error(f"Notes save failed: {e}")
+
+
+def override_listing_type(listing_id, listing_type):
+    supa = get_supabase()
+    if supa is None:
+        return
+    try:
+        supa.table(LISTINGS_TABLE).update(
+            {"listing_type_override": listing_type}
+        ).eq("id", listing_id).execute()
+    except Exception as e:
+        st.error(f"Type override failed: {e}")
+
+
+def get_effective_type(lead):
+    """Return the user override if set, otherwise the auto-detected type."""
+    return lead.get("listing_type_override") or lead.get("listing_type") or "other"
+
+
+def get_distinct_sources():
+    """Return sorted list of distinct source values actually in the DB."""
+    supa = get_supabase()
+    if supa is None:
+        return []
+    try:
+        resp = supa.table(LISTINGS_TABLE).select("source").limit(5000).execute()
+        vals = sorted({r["source"] for r in (resp.data or []) if r.get("source")})
+        return vals
+    except Exception:
+        return []
+
+
+def get_distinct_models():
+    """Return sorted list of models actually present, based on running the
+    extractor over every listing's title+snippet. Done in Python so we don't
+    need a stored model column."""
+    supa = get_supabase()
+    if supa is None:
+        return []
+    try:
+        resp = supa.table(LISTINGS_TABLE).select("title,snippet").limit(5000).execute()
+        models = set()
+        for r in (resp.data or []):
+            models.add(detect_model(r.get("title", ""), r.get("snippet", "") or ""))
+        return sorted(m for m in models if m != "Unknown model") + (
+            ["Unknown model"] if "Unknown model" in models else []
+        )
+    except Exception:
+        return []
 
 
 def delete_all_listings():
@@ -629,6 +910,7 @@ def render_lead_card(lead):
     brand = lead.get("brand", "unknown")
     brand_label = {"toro": "Toro", "john_deere": "John Deere", "mixed": "Mixed"}.get(brand, "?")
     brand_class = {"toro": "badge-toro", "john_deere": "badge-jd", "mixed": "badge-mixed"}.get(brand, "")
+    lid = lead["id"]
 
     with st.container(border=True):
         c1, c2, c3 = st.columns([1, 6, 2])
@@ -642,9 +924,14 @@ def render_lead_card(lead):
                             unsafe_allow_html=True)
 
         with c2:
+            # Row of badges: brand, bulk, type, starred
             badges = f'<span class="badge {brand_class}">{brand_label}</span>'
             if lead.get("is_bulk"):
                 badges += '<span class="badge badge-bulk">🔥 BULK</span>'
+            type_label = LISTING_TYPE_LABELS.get(get_effective_type(lead), "📰 Other")
+            badges += f'<span class="badge badge-type">{html.escape(type_label)}</span>'
+            if lead.get("starred"):
+                badges += '<span class="badge badge-star">⭐ STARRED</span>'
 
             safe_title = html.escape(lead["title"][:140])
             safe_url = html.escape(lead["url"], quote=True)
@@ -668,24 +955,74 @@ def render_lead_card(lead):
                 meta_parts.append(f'📍 {html.escape(lead["location"])}')
             meta_parts.append(f'via {html.escape(lead["source"])}')
             meta_parts.append(f'first seen {format_date(lead["first_seen"])}')
-            meta_parts.append(f'#{lead["id"]}')
+            meta_parts.append(f'#{lid}')
             st.markdown(
                 f'<div class="lead-meta" style="margin-top:8px;">{" · ".join(meta_parts)}</div>',
                 unsafe_allow_html=True,
             )
 
+            # Inline notes - collapsed by default unless there's already a note
+            existing_notes = lead.get("notes") or ""
+            notes_label = "📝 Edit notes" if existing_notes else "📝 Add notes"
+            with st.expander(notes_label, expanded=bool(existing_notes)):
+                new_notes = st.text_area(
+                    "Notes",
+                    value=existing_notes,
+                    key=f"notes_{lid}",
+                    label_visibility="collapsed",
+                    placeholder="e.g. called seller, left VM, waiting callback",
+                    height=80,
+                )
+                if new_notes != existing_notes:
+                    if st.button("Save notes", key=f"save_notes_{lid}", type="primary"):
+                        update_listing_notes(lid, new_notes)
+                        st.rerun()
+
         with c3:
+            # Status dropdown
             statuses = ["new", "contacted", "purchased", "dead", "ignored"]
             current = lead.get("status") or "new"
             new_status = st.selectbox(
                 "Status", statuses,
                 index=statuses.index(current) if current in statuses else 0,
-                key=f"status_{lead['id']}", label_visibility="collapsed",
+                key=f"status_{lid}", label_visibility="collapsed",
             )
             if new_status != current:
-                update_listing_status(lead["id"], new_status)
+                update_listing_status(lid, new_status)
                 st.rerun()
+
+            # Open link
             st.link_button("Open ↗", lead["url"], use_container_width=True)
+
+            # Star + Delete row
+            starred = bool(lead.get("starred"))
+            sb, db = st.columns(2)
+            if sb.button(
+                "⭐" if not starred else "★ starred",
+                key=f"star_{lid}",
+                use_container_width=True,
+                help="Star this lead to keep it at the top",
+            ):
+                toggle_star(lid, not starred)
+                st.rerun()
+            if db.button(
+                "🗑️",
+                key=f"del_{lid}",
+                use_container_width=True,
+                help="Delete this listing (can't be undone)",
+            ):
+                st.session_state[f"confirm_del_{lid}"] = True
+
+            if st.session_state.get(f"confirm_del_{lid}"):
+                st.warning(f"Delete #{lid}?", icon="⚠️")
+                cc1, cc2 = st.columns(2)
+                if cc1.button("Yes, delete", key=f"yesdel_{lid}", type="primary", use_container_width=True):
+                    delete_listing(lid)
+                    st.session_state.pop(f"confirm_del_{lid}", None)
+                    st.rerun()
+                if cc2.button("Cancel", key=f"nodel_{lid}", use_container_width=True):
+                    st.session_state.pop(f"confirm_del_{lid}", None)
+                    st.rerun()
 
 
 # ============================================================================
@@ -872,11 +1209,12 @@ if st.session_state.get("run_search_clicked"):
             )
 
 stats = get_stats()
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Total leads", stats["total"])
 c2.metric("🔥 Bulk sellers", stats["bulk_total"])
-c3.metric("New (unreviewed)", stats["new_count"])
-c4.metric("Bulk · new", stats["bulk_new"])
+c3.metric("⭐ Starred", stats["starred"])
+c4.metric("New (unreviewed)", stats["new_count"])
+c5.metric("Bulk · new", stats["bulk_new"])
 
 st.markdown("### ")
 
@@ -893,38 +1231,132 @@ with tab_leads:
             "or use 'Load demo data' to see the UI with sample data."
         )
     else:
-        fc1, fc2, fc3, fc4, fc5 = st.columns([1.5, 1.5, 1.5, 1.5, 2])
-        bulk_only = fc1.checkbox("🔥 Bulk only", value=False)
-        brand_ui = fc2.selectbox("Brand", ["All", "Toro", "John Deere", "Mixed"])
+        # Top toggle row: view mode + quick filters
+        tc1, tc2, tc3, tc4 = st.columns([2, 1.2, 1.2, 1.2])
+        view_mode = tc1.radio(
+            "View", ["Grouped by type", "Flat list"], horizontal=True,
+            label_visibility="collapsed",
+        )
+        bulk_only = tc2.checkbox("🔥 Bulk only")
+        starred_only = tc3.checkbox("⭐ Starred only")
+        hide_ignored = tc4.checkbox("Hide ignored", value=True)
+
+        # Filter row 1
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        brand_ui = fc1.selectbox("Brand", ["All", "Toro", "John Deere", "Mixed"])
+        type_options = ["All"] + LISTING_TYPE_ORDER
+        type_labels_ui = ["All"] + [LISTING_TYPE_LABELS[t] for t in LISTING_TYPE_ORDER]
+        type_choice = fc2.selectbox("Listing type", type_labels_ui)
+        # Map label back to db value
+        if type_choice == "All":
+            type_filter_db = None
+        else:
+            type_filter_db = LISTING_TYPE_ORDER[type_labels_ui.index(type_choice) - 1]
+
         status_filter = fc3.selectbox(
             "Status", ["All", "new", "contacted", "purchased", "dead", "ignored"]
         )
         days_filter = fc4.selectbox(
             "Recency", ["All time", "Last 7 days", "Last 30 days", "Last 90 days"]
         )
-        search_text = fc5.text_input("Search title/details", placeholder="e.g. Greensmaster 1600")
 
-        days_map = {"All time": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}
-        brand_map = {"All": None, "Toro": "toro", "John Deere": "john_deere", "Mixed": "mixed"}
+        # Filter row 2
+        gc1, gc2, gc3, gc4 = st.columns(4)
+        source_options = ["All"] + get_distinct_sources()
+        source_filter = gc1.selectbox("Source", source_options)
+
+        model_options = ["All"] + get_distinct_models()
+        model_filter = gc2.selectbox("Model", model_options)
+
+        sort_labels = {
+            "smart": "⭐ Smart (starred, bulk, newest)",
+            "newest": "🕐 Newest first",
+            "oldest": "🕐 Oldest first",
+            "quantity": "🔢 Most units first",
+            "bulk": "🔥 Bulk first, then qty",
+        }
+        sort_choice = gc3.selectbox(
+            "Sort", list(sort_labels.keys()),
+            format_func=lambda k: sort_labels[k],
+        )
+
+        search_text = gc4.text_input("Search title/details",
+                                     placeholder="e.g. Greensmaster 1600")
+
+        days_map = {"All time": None, "Last 7 days": 7,
+                    "Last 30 days": 30, "Last 90 days": 90}
+        brand_map = {"All": None, "Toro": "toro",
+                     "John Deere": "john_deere", "Mixed": "mixed"}
 
         leads = fetch_listings(
             bulk_only=bulk_only,
+            starred_only=starred_only,
             brand=brand_map[brand_ui],
-            status=status_filter,
+            status=None if status_filter == "All" else status_filter,
+            listing_type=type_filter_db,
+            source=None if source_filter == "All" else source_filter,
             days=days_map[days_filter],
             search=search_text or None,
+            sort=sort_choice,
+            limit=1000,
         )
 
-        st.caption(
-            f"Showing {len(leads)} of {stats['total']} total "
-            f"{'(capped at 500 — tighten filters to see older ones)' if len(leads) >= 500 else ''}"
-        )
+        # Client-side: hide ignored, filter by model (model isn't a stored column)
+        if hide_ignored and status_filter == "All":
+            leads = [l for l in leads if l.get("status") != "ignored"]
+
+        if model_filter != "All":
+            leads = [
+                l for l in leads
+                if detect_model(l.get("title", ""), l.get("snippet", "") or "") == model_filter
+            ]
+
+        # Apply type override client-side (so user manual overrides take effect
+        # for display AND for grouping)
+        if type_filter_db is not None:
+            leads = [l for l in leads if get_effective_type(l) == type_filter_db]
+
+        # Summary line
+        summary_bits = [f"Showing **{len(leads)}** of {stats['total']} total"]
+        if leads:
+            by_type = {}
+            for l in leads:
+                t = get_effective_type(l)
+                by_type[t] = by_type.get(t, 0) + 1
+            breakdown = " · ".join(
+                f"{LISTING_TYPE_LABELS[t]}: {by_type[t]}"
+                for t in LISTING_TYPE_ORDER if t in by_type
+            )
+            summary_bits.append(breakdown)
+        st.markdown(" &nbsp; • &nbsp; ".join(summary_bits))
+
+        if len(leads) >= 1000:
+            st.caption("Result set capped at 1000. Tighten filters to see more.")
 
         if not leads:
-            st.info("No listings match those filters.")
+            st.info("No listings match those filters. Try clearing some above.")
         else:
-            for lead in leads:
-                render_lead_card(lead)
+            if view_mode == "Flat list":
+                for lead in leads:
+                    render_lead_card(lead)
+            else:
+                # Grouped view — render each listing type as its own section
+                grouped = {t: [] for t in LISTING_TYPE_ORDER}
+                for lead in leads:
+                    grouped.setdefault(get_effective_type(lead), []).append(lead)
+
+                for t in LISTING_TYPE_ORDER:
+                    bucket = grouped.get(t, [])
+                    if not bucket:
+                        continue
+                    st.markdown(
+                        f'<div class="category-header">{LISTING_TYPE_LABELS[t]}'
+                        f'<span class="count">· {len(bucket)} listing'
+                        f'{"s" if len(bucket) != 1 else ""}</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    for lead in bucket:
+                        render_lead_card(lead)
 
 
 # ---- SETTINGS TAB ----
@@ -995,7 +1427,8 @@ with tab_export:
         all_rows = fetch_all_listings()
         if all_rows:
             df = pd.DataFrame(all_rows)
-            cols = ["id", "source", "brand", "quantity", "is_bulk", "title", "url",
+            cols = ["id", "source", "listing_type", "listing_type_override", "brand",
+                    "quantity", "is_bulk", "starred", "title", "url",
                     "price", "location", "first_seen", "status", "notes", "snippet"]
             df = df[[c for c in cols if c in df.columns]]
             csv_bytes = df.to_csv(index=False).encode()
@@ -1014,6 +1447,32 @@ with tab_export:
         "You can also view, edit, or query your data directly in the Supabase dashboard "
         "→ Table Editor → `mower_listings`. Good for ad-hoc SQL analysis or bulk cleanup."
     )
+
+    st.divider()
+    st.markdown("### 🧹 Bulk cleanup")
+    st.caption(
+        "Quickly remove listings that are no longer useful. "
+        "Less destructive than the danger zone below."
+    )
+    cc1, cc2 = st.columns([2, 1])
+    cleanup_status = cc1.selectbox(
+        "Delete listings with status",
+        ["ignored", "dead", "ignored + dead"],
+        help="Frees up the list by removing leads you've already dismissed.",
+    )
+    if cc2.button("Run cleanup", use_container_width=True):
+        supa = get_supabase()
+        if supa is not None:
+            try:
+                if cleanup_status == "ignored + dead":
+                    supa.table(LISTINGS_TABLE).delete().in_("status", ["ignored", "dead"]).execute()
+                else:
+                    supa.table(LISTINGS_TABLE).delete().eq("status", cleanup_status).execute()
+                st.success(f"Cleaned up listings with status: {cleanup_status}")
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Cleanup failed: {e}")
 
     st.divider()
     st.markdown("### 🚨 Danger zone")
@@ -1039,37 +1498,64 @@ Every time you click **🚀 Run Search Now**, the app:
 1. Generates ~25 targeted search queries by combining your model list with broad bulk-seller phrases
 2. Runs them across the sources you've enabled (Google, eBay, GovDeals, Reddit)
 3. Filters out irrelevant results (zero-turn, lawn tractors, toys, etc.)
-4. Detects quantity mentions — *"fleet of 6"*, *"(4) Greensmaster"*, *"3 John Deere 220SL"*
-5. Flags anything at or above your bulk threshold (default 3+ units) with 🔥
-6. Saves everything to your Supabase database — dedup is automatic via URL+title fingerprinting
+4. Restricts to continental US (excludes Hawaii, Alaska, non-US)
+5. Detects quantity mentions — *"fleet of 6"*, *"(4) Greensmaster"*, *"3 John Deere 220SL"*
+6. Classifies each listing into a type: Auction / Dealer / Marketplace / Classified / Other
+7. Flags bulk-seller listings (default: 3+ units) with 🔥
+8. Saves everything to your Supabase database — deduped automatically
+
+### Managing leads
+
+Each lead card has:
+- **⭐ Star** — pin important leads to the top in Smart sort
+- **🗑️ Delete** — permanently remove a listing (asks for confirmation)
+- **📝 Notes** — jot notes like "called seller, waiting callback"
+- **Status** dropdown — move leads through your pipeline: new → contacted → purchased / dead / ignored
+- **Open ↗** — go to the original listing
+
+### Filters and views
+
+- **Grouped view** (default) — organizes listings by type: Auction, Dealer, Marketplace, Classified, Other
+- **Flat list** — single feed, useful when you want everything sorted together
+- **Filters**: Brand, Listing type, Status, Recency, Source, Model, + free-text search
+- **Sort**: Smart (starred → bulk → newest) / Newest / Oldest / Most units / Bulk first
+- **Hide ignored** — on by default, keeps dismissed leads out of sight
+
+### What each listing type means
+
+- 🔨 **Auction** — GovDeals, estate sales, timed auctions with deadlines. Act fast.
+- 🏪 **Dealer/Reseller** — professional turf equipment dealers. Best for negotiating bulk pricing.
+- 🛒 **Marketplace** — eBay, Craigslist-style. Usually fixed-price or best-offer.
+- 💬 **Classified/Forum** — Reddit, TurfNet, GolfWRX. Direct-from-superintendent signals, often unlisted elsewhere.
+- 📰 **Other** — anything that didn't fit above (press releases, blog posts, unknown sellers).
 
 ### Why Supabase
 
-Your leads are now in a real Postgres database. That means:
+Your leads are in a real Postgres database. That means:
 - **Never lose data.** Even if Streamlit redeploys, everything persists.
-- **Access from anywhere.** Open the Supabase dashboard → Table Editor to view, edit, or bulk-update rows directly in a spreadsheet UI.
-- **Run SQL.** Want to know "how many Toro bulk leads came from GovDeals in the last 30 days by location"? You can write that query in the Supabase SQL Editor.
-- **Future-proof.** Later, you could connect your Shopify store, a Zapier workflow, or any other tool directly to the same database.
+- **Access from anywhere.** Supabase dashboard → Table Editor for a spreadsheet UI view of every lead.
+- **Run SQL.** Write custom queries like *"top 10 cities for bulk Toro leads in the last 90 days"*.
+- **Future-proof.** Later, connect Zapier, email automations, or your Shopify store to the same database.
 
 ### What each source is good for
 
-- **Google (SerpAPI)** — Broadest coverage. Catches dealer sites, forum classifieds, niche auction sites. Requires a paid API key (free tier: 100 searches/mo; $50/mo for 5,000).
-- **eBay** — Strong signal for fleet liquidations. Free, no key needed.
-- **GovDeals** — The sleeper hit. Municipal golf courses retire fleets through government surplus auctions. Free, few of your competitors are looking here.
-- **Reddit** — Low volume, high-intent posts from superintendents. Free.
+- **Google (SerpAPI)** — Broadest coverage. Dealer sites, forum classifieds, niche auctions. Requires SerpAPI key.
+- **eBay** — Strong for fleet liquidations. Free, no key needed.
+- **GovDeals** — The sleeper hit. Municipal golf courses retire fleets via gov surplus auctions. Free.
+- **Reddit** — Low volume, high-intent superintendent posts. Free.
 
 ### Tips
 
-- **Run searches every few days.** Source sites don't change that quickly.
-- **Work the 🔥 Bulk list first.** Highest-value leads.
-- **Use the Status dropdown** to track your pipeline (new → contacted → purchased/dead).
-- **Tune the model list in Settings** as you encounter new naming conventions in the wild (e.g. "GM1000" instead of "Greensmaster 1000").
-- **For ad-hoc analysis**, open your Supabase dashboard → SQL Editor and write custom queries against `mower_listings`.
+- **Run searches every few days.** Sources don't change that quickly.
+- **Work the 🔥 Bulk list first, then ⭐ starred.** Highest-value leads.
+- **Use 🗑️ delete for obvious junk, "Status → ignored" for maybes.** Ignored leads are hidden by default but you can still pull them back; deleted ones are gone.
+- **Add notes as you reach out.** Future you will thank present you.
+- **Tune the model list in Settings** as you encounter new naming conventions in the wild.
 
 ### Cost
 
-- **Streamlit Cloud**: Free forever for personal/business use
-- **Supabase**: Free tier covers ~50k rows in this DB, more than enough
+- **Streamlit Cloud**: Free forever
+- **Supabase**: Free tier covers ~50k listings, way more than you need
 - **SerpAPI**: Free (100 searches/mo) or $50/mo (5,000 searches ≈ 200 full scans)
 - **eBay / GovDeals / Reddit**: Free
 """)
