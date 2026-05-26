@@ -315,9 +315,41 @@ NON_US_CURRENCY_RX = re.compile(
 NON_US_TLD_RX = re.compile(
     r"\.(co\.uk|co\.nz|co\.za|co\.in|co\.il|com\.au|com\.mx|com\.br|com\.sg|com\.hk|"
     r"\.ca|\.uk|\.au|\.nz|\.de|\.fr|\.it|\.es|\.nl|\.be|\.se|\.no|\.fi|\.dk|"
-    r"\.jp|\.cn|\.kr|\.tw|\.in|\.ie|\.za|\.mx|\.br|\.ar|\.cl|\.ph)(?:/|$)",
+    r"\.jp|\.cn|\.kr|\.tw|\.in|\.ie|\.za|\.mx|\.br|\.ar|\.cl|\.ph|\.ke|\.ng|\.eg)(?:/|$)",
     re.I,
 )
+
+# Explicit vendor blocklist — domains Mike does not want surfaced regardless of
+# what country they appear to serve. Match by hostname suffix so subdomains
+# (e.g. www.needturfequipment.com) and paths also match.
+BLOCKED_VENDOR_HOSTS = {
+    "needturfequipment.com",
+    "ramadonturf.com",
+    "marketbook.ke",
+    "golfmowersaustralia.com.au",
+    "farmandplant.ie",
+}
+
+
+def vendor_blocked(url):
+    """Return True if URL's host (or any parent domain) is in BLOCKED_VENDOR_HOSTS."""
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(str(url)).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    # Strip leading www. and check the host plus all parent domains
+    host = host.removeprefix("www.")
+    parts = host.split(".")
+    for i in range(len(parts) - 1):
+        candidate = ".".join(parts[i:])
+        if candidate in BLOCKED_VENDOR_HOSTS:
+            return True
+    return False
 
 HI_AK_NAME_RX = re.compile(
     r"\bhawaii\b|\balaska\b|"
@@ -1329,6 +1361,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
         source = r.get("source", "")
         is_dealer_scan = source.startswith("dealer/")
         if not is_dealer_scan and not url_is_specific_listing(r.get("url", "")):
+            continue
+        if vendor_blocked(r.get("url", "")):
             continue
         if not location_acceptable(r.get("title", ""), r.get("location", ""),
                                    snippet=r.get("snippet", ""), url=r.get("url", "")):
