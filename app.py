@@ -285,9 +285,37 @@ def is_relevant(title, snippet=""):
 
 NON_US_COUNTRY_RX = re.compile(
     r"\b(canada|canadian|united\s*kingdom|\bu\.?k\.?\b|england|scotland|wales|ireland|"
-    r"australia|new\s*zealand|germany|france|italy|spain|netherlands|belgium|"
-    r"japan|china|mexico|brazil|philippines|south\s*africa|"
-    r"ontario|quebec|alberta|manitoba|british\s*columbia|nova\s*scotia|saskatchewan)\b",
+    r"australia|australian|new\s*zealand|nz|germany|france|italy|spain|netherlands|belgium|"
+    r"portugal|sweden|norway|finland|denmark|poland|austria|switzerland|"
+    r"japan|china|chinese|hong\s*kong|singapore|malaysia|thailand|vietnam|india|indian|"
+    r"mexico|mexican|brazil|brazilian|argentina|chile|colombia|peru|"
+    r"philippines|south\s*africa|nigeria|kenya|egypt|"
+    # Canadian provinces
+    r"ontario|quebec|alberta|manitoba|british\s*columbia|nova\s*scotia|saskatchewan|"
+    r"newfoundland|prince\s*edward|yukon|nunavut|northwest\s*territories|"
+    # Australian states
+    r"new\s*south\s*wales|victoria|queensland|western\s*australia|south\s*australia|"
+    r"tasmania|northern\s*territory|"
+    # Common foreign cities (frequent in listings)
+    r"toronto|vancouver|montreal|calgary|edmonton|ottawa|winnipeg|"
+    r"london|manchester|birmingham|glasgow|liverpool|edinburgh|"
+    r"sydney|melbourne|brisbane|perth|adelaide|auckland|wellington|"
+    r"dublin|paris|berlin|munich|amsterdam|rome|madrid|tokyo|johannesburg)\b",
+    re.I,
+)
+
+# Currency markers — almost always indicate non-US pricing
+NON_US_CURRENCY_RX = re.compile(
+    r"(£|€|¥|₹|₽|"
+    r"\bAUD\b|\bNZD\b|\bCAD\b|\bGBP\b|\bEUR\b|\bZAR\b|\bINR\b|\bJPY\b|"
+    r"A\$|C\$|NZ\$|R\$)",
+)
+
+# Foreign domain TLDs in URL — catches eBay UK / .com.au / .ca etc. at the source
+NON_US_TLD_RX = re.compile(
+    r"\.(co\.uk|co\.nz|co\.za|co\.in|co\.il|com\.au|com\.mx|com\.br|com\.sg|com\.hk|"
+    r"\.ca|\.uk|\.au|\.nz|\.de|\.fr|\.it|\.es|\.nl|\.be|\.se|\.no|\.fi|\.dk|"
+    r"\.jp|\.cn|\.kr|\.tw|\.in|\.ie|\.za|\.mx|\.br|\.ar|\.cl|\.ph)(?:/|$)",
     re.I,
 )
 
@@ -304,17 +332,27 @@ HI_AK_CODE_RX = re.compile(
 )
 
 
-def location_acceptable(title, location):
+def location_acceptable(title, location, snippet=None, url=None):
     """
     Return False if the listing is clearly from outside the continental US
     (non-US countries, Hawaii, or Alaska). Return True if it looks US mainland
-    or the location is unknown.
+    or the location is unknown (conservative — keep unknowns; user prefers a few
+    extra reviews over missing a real lead).
+
+    Checks title, location, snippet (search result preview), AND the URL's TLD
+    (catches eBay UK / .com.au / .ca etc. at the source).
     """
-    for field in [location, title]:
+    # Foreign TLD in URL is a strong signal regardless of text
+    if url and NON_US_TLD_RX.search(str(url)):
+        return False
+
+    for field in [location, title, snippet]:
         if not field:
             continue
         s = str(field)
         if NON_US_COUNTRY_RX.search(s):
+            return False
+        if NON_US_CURRENCY_RX.search(s):
             return False
         if HI_AK_NAME_RX.search(s):
             return False
@@ -1292,7 +1330,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
         is_dealer_scan = source.startswith("dealer/")
         if not is_dealer_scan and not url_is_specific_listing(r.get("url", "")):
             continue
-        if not location_acceptable(r.get("title", ""), r.get("location", "")):
+        if not location_acceptable(r.get("title", ""), r.get("location", ""),
+                                   snippet=r.get("snippet", ""), url=r.get("url", "")):
             continue
         r["brand"] = detect_brand(*texts)
         if r["brand"] == "unknown": continue
