@@ -61,6 +61,59 @@ st.markdown("""
     .category-header .count {
         color: #7a8694; font-weight: 400; font-size: 14px; margin-left: 8px;
     }
+
+    /* Touch-friendly tap targets — affects all screen sizes */
+    .stButton button { min-height: 40px; }
+    [data-testid="stSelectbox"] > div > div { min-height: 40px; }
+
+    /* ─── MOBILE ─── stack columns + reduce padding below 768px */
+    @media (max-width: 768px) {
+        /* Force all st.columns() to stack vertically */
+        [data-testid="column"], [data-testid="stHorizontalBlock"] > div {
+            width: 100% !important;
+            flex: 0 0 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            margin-bottom: 8px;
+        }
+        /* Reclaim horizontal space */
+        .main .block-container {
+            padding-top: 1rem !important;
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            max-width: 100% !important;
+        }
+        /* Tap-target sizing for inputs on mobile */
+        .stButton button, .stSelectbox [data-baseweb="select"] > div,
+        .stTextInput input, .stTextArea textarea {
+            min-height: 44px !important;
+            font-size: 15px !important;
+        }
+        /* Smaller badges so the title doesn't overflow */
+        .badge {
+            font-size: 10px !important;
+            padding: 2px 6px !important;
+            margin-right: 4px;
+        }
+        .big-qty { font-size: 26px !important; }
+        .lead-meta { font-size: 12px !important; }
+        /* Metrics row: smaller numbers + labels */
+        [data-testid="stMetricValue"] { font-size: 22px !important; }
+        [data-testid="stMetricLabel"] { font-size: 11px !important; }
+        [data-testid="stMetric"] { padding: 6px !important; }
+        /* Tabs row scrolls horizontally instead of squishing */
+        [data-baseweb="tab-list"] {
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+        }
+        /* Hide the long URL preview on mobile (domain is enough) */
+        .lead-meta-url-long { display: none !important; }
+        /* Sidebar: collapsed by default on mobile (Streamlit handles this) */
+        [data-testid="stSidebar"] {
+            min-width: 0 !important;
+            width: 85vw !important;
+        }
+    }
 </style>
 """, unsafe_allow_html=True)
 
