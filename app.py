@@ -404,6 +404,87 @@ def vendor_blocked(url):
             return True
     return False
 
+
+# ============================================================================
+# New-inventory-without-price filter — blocks dealer "call for price" showroom
+# listings of brand-new 2026 mowers, which are overpriced retail and not the
+# used / pre-owned leads Mike is actually sourcing.
+# ============================================================================
+
+NEW_LISTING_URL_RX = re.compile(
+    r"/inventory/|/new[-/]?equipment|/new[-/]?mowers|/showroom|"
+    r"\bIsShowroom\s*=\s*1\b|/new[-_]?listings?/",
+    re.I,
+)
+
+NEW_LISTING_TEXT_RX = re.compile(
+    r"\bbrand[\s-]new\b|\bfactory[\s-]new\b|\bnever[\s-]used\b|"
+    r"\bnew\s+(?:from|in\s+box|condition|inventory|stock|equipment|machine|mower)\b|"
+    r"\b(?:202[5-9]|203[0-9])\s+(?:new|model|brand)",  # year + "new"/"model"/"brand"
+    re.I,
+)
+
+USED_LISTING_RX = re.compile(
+    r"\bused\b|\bpre[-\s]?owned\b|\brefurbish|\breconditioned\b|"
+    r"\bsecond[\s-]?hand\b|\bdemo\b|\brebuilt\b",
+    re.I,
+)
+
+NO_PRICE_TEXT_RX = re.compile(
+    r"\b(?:call|contact|inquire|request|email)\s*(?:for|us|about)?\s*"
+    r"(?:price|quote|pricing|details|info)\b|"
+    r"\bprice\s*(?:on|upon)\s*request\b|"
+    r"\b(?:POA|TBD|MSRP|quote\s*on\s*request|call\s*for\s*pricing)\b",
+    re.I,
+)
+
+
+def price_is_missing(price):
+    """True if the price field is null/empty/zero/contact-us-style."""
+    if price is None:
+        return True
+    s = str(price).strip()
+    if not s:
+        return True
+    if NO_PRICE_TEXT_RX.search(s):
+        return True
+    # Zero with optional currency / decimals
+    if re.match(r"^\$?\s*0(?:\.0+)?\s*$", s):
+        return True
+    # No digit anywhere = not a usable price
+    if not re.search(r"\d", s):
+        return True
+    return False
+
+
+def looks_new_inventory(url, title, snippet):
+    """Heuristic: does this look like a brand-new dealer-inventory listing?
+    If 'used' / 'pre-owned' / 'refurbished' appears anywhere in title or
+    snippet, treat as used (don't block) — handles cases like a used 2026
+    model where year alone could be misleading."""
+    title_s = str(title or "")
+    snippet_s = str(snippet or "")
+    if USED_LISTING_RX.search(title_s) or USED_LISTING_RX.search(snippet_s):
+        return False
+    if url and NEW_LISTING_URL_RX.search(str(url)):
+        return True
+    if NEW_LISTING_TEXT_RX.search(title_s):
+        return True
+    if NEW_LISTING_TEXT_RX.search(snippet_s):
+        return True
+    return False
+
+
+def is_new_unpriced_listing(row):
+    """Block listings that are both 'looks new' AND have no usable price.
+    A new listing WITH a price still passes; a used listing without a price
+    still passes. Only the combination is excluded — matches Mike's pain
+    pattern of brand-new dealer showroom listings with 'Call for price'."""
+    return (
+        looks_new_inventory(row.get("url"), row.get("title"), row.get("snippet"))
+        and price_is_missing(row.get("price"))
+    )
+
 HI_AK_NAME_RX = re.compile(
     r"\bhawaii\b|\balaska\b|"
     r"honolulu|anchorage|fairbanks|juneau|\bhilo\b|"
@@ -1419,6 +1500,8 @@ def enrich_and_store(raw_results, bulk_threshold=3):
             continue
         if not location_acceptable(r.get("title", ""), r.get("location", ""),
                                    snippet=r.get("snippet", ""), url=r.get("url", "")):
+            continue
+        if is_new_unpriced_listing(r):
             continue
         r["brand"] = detect_brand(*texts)
         if r["brand"] == "unknown": continue
