@@ -418,11 +418,19 @@ NEW_LISTING_URL_RX = re.compile(
 )
 
 NEW_LISTING_TEXT_RX = re.compile(
-    r"\bbrand[\s-]new\b|\bfactory[\s-]new\b|\bnever[\s-]used\b|"
-    r"\bnew\s+(?:from|in\s+box|condition|inventory|stock|equipment|machine|mower)\b|"
+    # "brand new" / "factory new" must be followed by a thing-being-sold noun
+    # (not "brand new REEL" — a refurbished part on a used mower)
+    r"\b(?:brand|factory)[\s-]new\s+(?:mower|machine|equipment|model|unit|tractor|inventory|in\s+box)\b|"
+    r"\bnever[\s-]used\s+(?:mower|machine|equipment|model|unit)\b|"
+    r"\bnew\s+(?:from\s+factory|in\s+box|condition|inventory|stock|equipment|machine|mower)\b|"
     r"\b(?:202[5-9]|203[0-9])\s+(?:new|model|brand)",  # year + "new"/"model"/"brand"
     re.I,
 )
+
+# Domains Mike's own businesses — never auto-filter listings from these.
+OWN_DOMAINS = {
+    "usedreelmowers.com",
+}
 
 USED_LISTING_RX = re.compile(
     r"\bused\b|\bpre[-\s]?owned\b|\brefurbish|\breconditioned\b|"
@@ -475,11 +483,33 @@ def looks_new_inventory(url, title, snippet):
     return False
 
 
+def _host_in_set(url, host_set):
+    """Return True if URL's host (or any parent domain) is in host_set."""
+    if not url:
+        return False
+    try:
+        host = (urlparse(str(url)).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    host = host.removeprefix("www.")
+    parts = host.split(".")
+    for i in range(len(parts) - 1):
+        if ".".join(parts[i:]) in host_set:
+            return True
+    return False
+
+
 def is_new_unpriced_listing(row):
     """Block listings that are both 'looks new' AND have no usable price.
     A new listing WITH a price still passes; a used listing without a price
     still passes. Only the combination is excluded — matches Mike's pain
-    pattern of brand-new dealer showroom listings with 'Call for price'."""
+    pattern of brand-new dealer showroom listings with 'Call for price'.
+
+    Listings on OWN_DOMAINS (Mike's own sites) are never filtered."""
+    if _host_in_set(row.get("url"), OWN_DOMAINS):
+        return False
     return (
         looks_new_inventory(row.get("url"), row.get("title"), row.get("snippet"))
         and price_is_missing(row.get("price"))
